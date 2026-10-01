@@ -85,15 +85,20 @@ import Darwin
         RunLoop.main.run(until:Date().addingTimeInterval(0.05))
         activity.timestamp = DispatchTime.now().uptimeNanoseconds
         _ = remote.observe(type:.keyDown,event:activity,now_ns:DispatchTime.now().uptimeNanoseconds,protected_mask:0)
-        RunLoop.main.run(until:Date().addingTimeInterval(0.04))
+        // Activation and its timer run asynchronously. Wait for the actual first
+        // start packet rather than assuming it was emitted within one sleep.
         var start: PeerPacket?
-        for _ in 0..<20 {
+        let start_deadline = peer_now_us()+1_000_000
+        while start == nil && peer_now_us() < start_deadline {
             var bytes = [UInt8](repeating:0,count:1201)
             let n = Darwin.recv(fd,&bytes,bytes.count,0)
-            if n < 0 { break }
-            if let p = try? JSONDecoder().decode(PeerPacket.self,from:Data(bytes.prefix(n))), p.kind == "start" { start = p }
+            if n >= 0 {
+                if let p = try? JSONDecoder().decode(PeerPacket.self,from:Data(bytes.prefix(n))), p.kind == "start" { start = p }
+            } else {
+                RunLoop.main.run(until:Date().addingTimeInterval(0.005))
+            }
         }
-        check(start?.window == window,"stale same-epoch hello cannot roll foreground scope back")
+        check(start?.window == window,"stale same-epoch hello cannot roll foreground scope back (first start window: \(start?.window ?? "missing"))")
         guard let start = start else { return }
         let instant = peer_now_us()
         var snapshot = PeerPacket(kind:"snapshot",instance:win,peer:response.instance,epoch:response.epoch,generation:start.generation,seq:10,time_us:instant)
