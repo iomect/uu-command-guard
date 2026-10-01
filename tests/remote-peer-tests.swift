@@ -66,12 +66,8 @@ import Darwin
         RunLoop.main.run(until:Date().addingTimeInterval(0.1))
         var buffer = [UInt8](repeating:0,count:1201)
         check(Darwin.recv(fd,&buffer,buffer.count,0) < 0,"acknowledged peer does not create hello feedback loop")
-        let window = UUID().uuidString
-        var prepare = PeerPacket(kind:"prepare",instance:win,peer:response.instance,epoch:response.epoch,generation:0,seq:4,time_us:peer_now_us())
-        prepare.window = window; prepare.scope = true; try send(prepare)
-        var stale_hello = PeerPacket(kind:"hello",instance:win,peer:response.instance,epoch:response.epoch,generation:0,seq:2,time_us:peer_now_us())
-        stale_hello.window = UUID().uuidString; stale_hello.scope = false; try send(stale_hello)
-        RunLoop.main.run(until:Date().addingTimeInterval(0.05))
+        // Keep the clock diagnostic independent of activation publications: with
+        // scope still false, this observation cannot enqueue a generation change.
         let activity = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true)!
         activity.timestamp = DispatchTime.now().uptimeNanoseconds
         _ = remote.observe(type:.keyDown,event:activity,now_ns:DispatchTime.now().uptimeNanoseconds,protected_mask:0)
@@ -81,6 +77,14 @@ import Darwin
         let decision_fields = decision_summary["last_keyboard_decision"] as? [String:Any] ?? [:]
         check(Set(decision_fields.keys) == Set(["reason","action","event_ns","callback_ns","protected_mask","corrected_class_mask","before","after"]),
               "keyboard decision diagnostics expose only allowed metadata")
+        let window = UUID().uuidString
+        var prepare = PeerPacket(kind:"prepare",instance:win,peer:response.instance,epoch:response.epoch,generation:0,seq:4,time_us:peer_now_us())
+        prepare.window = window; prepare.scope = true; try send(prepare)
+        var stale_hello = PeerPacket(kind:"hello",instance:win,peer:response.instance,epoch:response.epoch,generation:0,seq:2,time_us:peer_now_us())
+        stale_hello.window = UUID().uuidString; stale_hello.scope = false; try send(stale_hello)
+        RunLoop.main.run(until:Date().addingTimeInterval(0.05))
+        activity.timestamp = DispatchTime.now().uptimeNanoseconds
+        _ = remote.observe(type:.keyDown,event:activity,now_ns:DispatchTime.now().uptimeNanoseconds,protected_mask:0)
         RunLoop.main.run(until:Date().addingTimeInterval(0.04))
         var start: PeerPacket?
         for _ in 0..<20 {

@@ -27,8 +27,10 @@ fi
 build_directory=$(/usr/bin/mktemp -d "${PWD}/.build-app.XXXXXX")
 trap '/bin/rm -rf -- "$build_directory"' EXIT
 app_directory="$build_directory/UU 修补工具.app"
-/bin/mkdir -p "$app_directory/Contents/MacOS"
+/bin/mkdir -p "$app_directory/Contents/MacOS" "$app_directory/Contents/Resources"
 /bin/cp Info.plist "$app_directory/Contents/Info.plist"
+/bin/cp assets/app.icns "$app_directory/Contents/Resources/AppIcon.icns"
+/bin/cp assets/menu-bar.png "$app_directory/Contents/Resources/MenuBar.png"
 /usr/bin/plutil -lint "$app_directory/Contents/Info.plist"
 /bin/cp command-guard.swift "$build_directory/main.swift"
 /usr/bin/xcrun swiftc -warnings-as-errors -target "$(/usr/bin/uname -m)-apple-macosx13.0" \

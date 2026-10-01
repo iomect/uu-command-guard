@@ -101,6 +101,8 @@ jobs:
         with:
           go-version-file: windows/go.mod
           cache: false
+      - name: Generate application icon and manifest resources
+        run: python tools/build-windows-resources.py
       - name: Test Windows native ABI and offline state
         working-directory: windows
         run: go test -count=1 ./...
@@ -113,6 +115,14 @@ jobs:
           $env:GOARCH = 'amd64'
           go build -trimpath -ldflags='-H=windowsgui -s -w' -o ..\dist\UUCommandBridge.exe .
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Capture settings UI without input hooks or network
+        run: ./tools/capture-windows-ui.ps1 -Executable dist/UUCommandBridge.exe -Output dist/Windows-UI.png
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Windows-UI-preview
+          path: dist/Windows-UI.png
+          if-no-files-found: error
+          retention-days: 90
       - name: Verify executable and package license
         run: |
           $bytes = [IO.File]::ReadAllBytes('dist/UUCommandBridge.exe')

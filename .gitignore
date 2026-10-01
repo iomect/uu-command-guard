@@ -4,6 +4,7 @@
 /command-guard.new
 *.app
 *.exe
+*.syso
 *.zip
 .build-app.*
 .build-cli.*

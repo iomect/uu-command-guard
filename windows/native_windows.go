@@ -96,6 +96,8 @@ type config struct {
 }
 type native_app struct {
 	hwnd, edit, dialog                    uintptr
+	settings_ui                           *settings_ui
+	ui_preview                            bool
 	cfg                                   config
 	cfg_path                              string
 	commands                              chan ui_command
@@ -182,9 +184,9 @@ func (a *native_app) set_status(s string) {
 	call(user32, "PostMessageW", a.hwnd, 0x8003, 0, 0)
 }
 func (a *native_app) tray(add bool) error {
-	n := notifyicon{Size: uint32(unsafe.Sizeof(notifyicon{})), HWND: a.hwnd, ID: 1, Flags: 7, Callback: 0x8001, Icon: call(user32, "LoadIconW", 0, 32512)}
+	n := notifyicon{Size: uint32(unsafe.Sizeof(notifyicon{})), HWND: a.hwnd, ID: 1, Flags: 7, Callback: 0x8001, Icon: application_icon(ui_scale(16, window_dpi(a.hwnd)))}
 	if n.Icon == 0 {
-		return errors.New("无法加载系统托盘图标")
+		return errors.New("无法加载应用托盘图标")
 	}
 	a.mu.Lock()
 	s := "UU 局域网辅助 · " + a.status
@@ -252,27 +254,6 @@ func (a *native_app) menu() {
 		call(user32, "DestroyWindow", a.hwnd)
 	}
 }
-func (a *native_app) settings() error {
-	if a.dialog != 0 {
-		call(user32, "ShowWindow", a.dialog, 9)
-		call(user32, "SetForegroundWindow", a.dialog)
-		return nil
-	}
-	a.dialog = call(user32, "CreateWindowExW", 0x40000, uintptr(unsafe.Pointer(utf("UUBridgeSettings"))), uintptr(unsafe.Pointer(utf("UU 局域网辅助 · 设置 Mac IPv4"))), 0x10ca0000, 0x80000000, 0x80000000, 360, 155, a.hwnd, 0, call(kernel32, "GetModuleHandleW", 0), 0)
-	if a.dialog == 0 {
-		return errors.New("无法创建 Mac IPv4 设置窗口")
-	}
-	call(user32, "CreateWindowExW", 0, uintptr(unsafe.Pointer(utf("STATIC"))), uintptr(unsafe.Pointer(utf("Mac IPv4（UDP 固定 47731）："))), 0x50000000, 16, 12, 320, 24, a.dialog, 0, 0, 0)
-	a.mu.Lock()
-	peer_setting := a.cfg.Peer
-	a.mu.Unlock()
-	a.edit = call(user32, "CreateWindowExW", 0x200, uintptr(unsafe.Pointer(utf("EDIT"))), uintptr(unsafe.Pointer(utf(peer_setting))), 0x50010080, 16, 40, 310, 25, a.dialog, 10, 0, 0)
-	call(user32, "CreateWindowExW", 0, uintptr(unsafe.Pointer(utf("BUTTON"))), uintptr(unsafe.Pointer(utf("保存"))), 0x50010001, 160, 80, 80, 26, a.dialog, 11, 0, 0)
-	call(user32, "CreateWindowExW", 0, uintptr(unsafe.Pointer(utf("BUTTON"))), uintptr(unsafe.Pointer(utf("取消"))), 0x50010000, 248, 80, 80, 26, a.dialog, 12, 0, 0)
-	call(user32, "SetFocus", a.edit)
-	call(user32, "SetForegroundWindow", a.dialog)
-	return nil
-}
 func wnd_proc(h uintptr, m uint32, w, l uintptr) uintptr {
 	a := native
 	if a != nil {
@@ -301,6 +282,7 @@ func wnd_proc(h uintptr, m uint32, w, l uintptr) uintptr {
 		case 0x8003:
 			// Explorer 重建任务栏时由 TaskbarCreated 重新添加。
 			a.tray(false)
+			a.refresh_settings_status()
 			return 0
 		case 0x8005:
 			if e := a.settings(); e != nil {
@@ -329,10 +311,13 @@ func wnd_proc(h uintptr, m uint32, w, l uintptr) uintptr {
 func settings_proc(h uintptr, m uint32, w, l uintptr) uintptr {
 	a := native
 	if a != nil {
+		if result, handled := a.settings_message(h, m, w, l); handled {
+			return result
+		}
 		switch m {
 		case 0x111:
 			switch uint16(w) {
-			case 11:
+			case 1, 11:
 				b := make([]uint16, 64)
 				call(user32, "GetWindowTextW", a.edit, uintptr(unsafe.Pointer(&b[0])), 64)
 				s := strings.TrimSpace(syscall.UTF16ToString(b))
@@ -342,17 +327,22 @@ func settings_proc(h uintptr, m uint32, w, l uintptr) uintptr {
 						return 0
 					}
 				}
-				a.commands <- ui_command{Kind: "peer", Value: s}
+				if !a.ui_preview {
+					a.commands <- ui_command{Kind: "peer", Value: s}
+				}
 				call(user32, "DestroyWindow", h)
 				return 0
-			case 12:
+			case 2, 12:
 				call(user32, "DestroyWindow", h)
 				return 0
 			}
-		case 2:
+		case 0x82:
+			a.release_settings_ui()
 			a.dialog = 0
 			a.edit = 0
-			return 0
+			if a.ui_preview {
+				call(user32, "PostQuitMessage", 0)
+			}
 		}
 	}
 	return call(user32, "DefWindowProcW", h, uintptr(m), w, l)
@@ -772,7 +762,7 @@ func run_native() error {
 		name string
 		proc uintptr
 	}{{"UUBridgeTray", proc}, {"UUBridgeSettings", setting}} {
-		wc := wndclass{Size: uint32(unsafe.Sizeof(wndclass{})), Proc: c.proc, Instance: call(kernel32, "GetModuleHandleW", 0), Name: utf(c.name), Cursor: call(user32, "LoadCursorW", 0, 32512), Background: 6}
+		wc := wndclass{Size: uint32(unsafe.Sizeof(wndclass{})), Proc: c.proc, Instance: call(kernel32, "GetModuleHandleW", 0), Name: utf(c.name), Cursor: call(user32, "LoadCursorW", 0, 32512), Background: 6, Icon: application_icon(ui_scale(32, window_dpi(0))), SmallIcon: application_icon(ui_scale(16, window_dpi(0)))}
 		if call(user32, "RegisterClassExW", uintptr(unsafe.Pointer(&wc))) == 0 {
 			return errors.New("窗口注册失败")
 		}
@@ -832,8 +822,9 @@ func native_offline_check() (err error) {
 	if unsafe.Sizeof(msg{}) != 48 || unsafe.Sizeof(wndclass{}) != 80 || unsafe.Sizeof(notifyicon{}) != 976 || unsafe.Sizeof(keyboard{}) != 24 || unsafe.Sizeof(mouse{}) != 32 {
 		return errors.New("Win32 结构大小错误")
 	}
-	if unsafe.Sizeof(open_file_name{}) != 152 || unsafe.Offsetof(open_file_name{}.File) != 48 || unsafe.Offsetof(open_file_name{}.Flags) != 96 || unsafe.Offsetof(open_file_name{}.Reserved) != 128 {
-		return errors.New("Win32 保存对话框结构布局错误")
+	// Windows x64 的 lpTemplateName 位于 128，之后的 pvReserved 位于 136。
+	if unsafe.Sizeof(open_file_name{}) != 152 || unsafe.Offsetof(open_file_name{}.File) != 48 || unsafe.Offsetof(open_file_name{}.Flags) != 96 || unsafe.Offsetof(open_file_name{}.Reserved) != 136 {
+		return fmt.Errorf("Win32 保存对话框结构布局错误: size=%d File=%d Flags=%d Reserved=%d", unsafe.Sizeof(open_file_name{}), unsafe.Offsetof(open_file_name{}.File), unsafe.Offsetof(open_file_name{}.Flags), unsafe.Offsetof(open_file_name{}.Reserved))
 	}
 	syscall.NewCallback(wnd_proc)
 	syscall.NewCallback(settings_proc)

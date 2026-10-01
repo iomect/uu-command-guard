@@ -5,7 +5,7 @@ import ApplicationServices
 import Carbon
 import Darwin
 
-let guard_version = "2026-10-01.8"
+let guard_version = "2026-10-01.9"
 let recovery_interval: UInt64 = 300_000_000
 let log_retention_seconds: TimeInterval = 3600
 
@@ -704,7 +704,14 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add_action("打开辅助功能设置…", #selector(open_permissions))
         menu.addItem(.separator())
         add_action("退出 UU 修补工具", #selector(quit))
-        status_item.button?.title = "UU"
+        if let icon_url = Bundle.main.url(forResource: "MenuBar", withExtension: "png"),
+           let image = NSImage(contentsOf: icon_url) {
+            image.size = NSSize(width: 18, height: 18)
+            image.isTemplate = true
+            status_item.button?.image = image
+            status_item.button?.imagePosition = .imageLeading
+        }
+        status_item.button?.title = status_item.button?.image == nil ? "UU" : ""
         status_item.menu = menu
         NSApplication.shared.delegate = self
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.refresh() }
@@ -739,7 +746,8 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         peer_toggle.state = peer_status.0 ? .on : .off
         peer_item.title = "辅助：\(peer_status.1)"
         peer_counts_item.title = "远端修正：\(peer_status.2)　跳过：\(peer_status.3)"
-        status_item.button?.title = snapshot.monitoring && snapshot.tap_enabled ? "UU" : "UU!"
+        let healthy = snapshot.monitoring && snapshot.tap_enabled
+        status_item.button?.title = status_item.button?.image == nil ? (healthy ? "UU" : "UU!") : (healthy ? "" : "!")
         status_item.button?.toolTip = "UU 修补工具：\(snapshot.summary)"
     }
 

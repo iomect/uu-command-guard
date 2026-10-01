@@ -1,6 +1,6 @@
 # UU 修补工具：Windows ↔ Mac 局域网辅助
 
-Mac 版本 `2026-10-01.8`。Windows 用 UU 远程操作 Mac 时，辅助修正 UU 事件中的 Command、Option、Control 标记。Mac 保留原有离线鼠标残留标记修补和自动保持微信输入法功能。本项目采用 [MIT 许可证](LICENSE)，与 UU 官方无关联。
+Mac 版本 `2026-10-01.9`。Windows 用 UU 远程操作 Mac 时，辅助修正 UU 事件中的 Command、Option、Control 标记。Mac 保留原有离线鼠标残留标记修补和自动保持微信输入法功能。本项目采用 [MIT 许可证](LICENSE)，与 UU 官方无关联。
 
 程序只改变已存在事件的修饰标记，不改变键码、文字、事件类型或时间戳，不补发或重放输入。`flagsChanged` 只观察。首次学习、证据迟到、配对不明确、映射未经验证时会跳过；修正计数不能代表应用操作成功。
 
@@ -72,7 +72,7 @@ ZIP 包含程序、MIT 许可证和安装说明，同目录提供 `.sha256`。Ma
 
 ### 本地构建
 
-Mac 需要系统 Swift 工具链，部署目标 macOS 13 以上；应用针对当前构建机器的架构生成。Windows 源码需要 Go 1.26 或以上，无第三方依赖。
+Mac 需要系统 Swift 工具链，部署目标 macOS 13 以上；应用针对当前构建机器的架构生成。Windows 源码需要 Go 1.26 或以上及 Python 3，无第三方依赖。Python 仅在构建时生成图标和 manifest 资源，最终仍为单文件 EXE。
 
 ```sh
 mkdir -p dist
@@ -86,6 +86,7 @@ Mac 脚本编译三个 Swift 文件，运行自测并进行 ad-hoc 签名；不�
 Windows 本机 PowerShell 构建：
 
 ```powershell
+python tools/build-windows-resources.py
 Set-Location windows
 New-Item -ItemType Directory -Force ..\dist | Out-Null
 go test -race ./...
@@ -94,6 +95,8 @@ go build -trimpath -ldflags='-H=windowsgui -s -w' -o ..\dist\UUCommandBridge.exe
 ```
 
 若没有用于 `-race` 的 C 编译器，可执行 `go test ./...` 并记录 race 检查缺口；程序构建本身不需要 C 编译器。不要安装全局依赖来绕过检查。
+
+两端图标的矢量源文件在 `assets/app.svg`，Mac 菜单栏图标在 `assets/menu-bar.svg`；对应 ICNS、ICO、PNG 已随源码提供，构建无需图像处理依赖。Windows 设置界面使用原生主题、系统 DPI 缩放和 Segoe UI 字体。开发者可用 `UUCommandBridge.exe --ui-preview` 单独预览窗口，该模式不启动输入钩子、网络或读取配置；Actions 会保存真实窗口截图到 `Windows-UI-preview` artifact。
 
 离线与跨语言验证：
 

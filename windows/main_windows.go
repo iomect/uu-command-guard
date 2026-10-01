@@ -10,6 +10,11 @@ import (
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "--ui-preview":
+			if e := run_ui_preview(); e != nil {
+				message("界面预览失败", e.Error())
+			}
+			return
 		case "--report":
 			if len(os.Args) != 3 {
 				message("报告参数", "请使用 --report <输出 JSON 路径>")
