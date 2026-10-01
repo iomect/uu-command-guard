@@ -1,0 +1,28 @@
+# Local builds and installed-app backups
+/dist/
+/command-guard
+/command-guard.new
+*.app
+*.exe
+*.zip
+.build-app.*
+.build-cli.*
+
+# Runtime files and diagnostics
+logs/
+.guard.lock
+/validation/
+*.log
+# Reports may use any filename; only the audited protocol fixture is public.
+*.json
+!/protocol/sample.json
+
+# Personal settings and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.DS_Store
+__pycache__/
+*.pyc
