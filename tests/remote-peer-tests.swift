@@ -445,7 +445,126 @@ import Darwin
         gap.ingest([],gap:true,now:1_050_000)
         check(gap.mappings.isEmpty && gap.mapping_edges.isEmpty,"source gaps revoke confirmed and partial mapping evidence")
     }
+    static func manual_ready(_ configuration: PeerManualMapping) -> PeerMatcher {
+        let m = ready()
+        m.configure_mapping(configuration,now:1_040_000)
+        for n in 4...6 {
+            let time = UInt64(1_010_000+n*10_000)
+            m.ingest([input(UInt64(n),time)],gap:false,now:Int64(time))
+            _ = m.decide(observation(Int64(time)+5000),now:Int64(time)+5000,protected:0)
+        }
+        return m
+    }
+    static func manual_mappings() {
+        check(PeerManualMapping(targets:[]) == nil && PeerManualMapping(targets:[0,4]) == nil &&
+              PeerManualMapping(targets:[0,4,6]) == nil && PeerManualMapping(targets:[-1,4,2]) == nil,
+              "manual configuration rejects malformed target lists")
+        let configuration = PeerManualMapping.default_mapping
+        let m = manual_ready(configuration)
+        check(m.ready && m.unverified_modifier_names.isEmpty && !m.verified_mapping(1),
+              "manual configuration enables mapping without claiming observed verification")
+        check(m.mapping_status_text.contains("手动") && !m.mapping_status_text.contains("已验证"),
+              "manual status distinguishes explicit configuration from learned evidence")
+        m.ingest([input(7,1_080_000,25,1)],gap:false,now:1_080_000)
+        check(m.decide(observation(1_085_000,25),now:1_085_000,protected:0)?.flags == target_flags[0]|8,
+              "manual Ctrl repairs a shortcut without modifier learning")
+        m.ingest([input(8,1_090_000,25,1|4)],gap:false,now:1_090_000)
+        let held = target_flags[0]|8|target_flags[2]|1
+        check(m.decide(observation(1_095_000,25),now:1_095_000,protected:0)?.flags == held,
+              "manual simultaneous modifiers remain held")
+        m.ingest([input(9,1_100_000,25,0)],gap:false,now:1_100_000)
+        check(m.decide(observation(1_105_000,25,held),now:1_105_000,protected:0)?.flags == 0,
+              "manual release clears residual modifier flags")
+        mapping_edge(m,10,1_110_000,224,0,8,true)
+        check(!m.verified_mapping(1),"configured down alone is not verified")
+        mapping_edge(m,11,1_120_000,224,0,8,false)
+        check(m.verified_mapping(1),"configured reliable down/up records verification")
+        mapping_edge(m,12,1_125_000,224,0,8,true)
+        check(m.verified_mapping(1),"normal long hold preserves previously observed manual verification")
+        m.stream_clear(now:1_127_000)
+        check(m.verified_mapping(1),"same-window idle retains observed manual verification")
+        m.ingest([],gap:true,now:1_130_000)
+        check(m.manual_mapping == configuration && m.mappings.count == 3 && !m.ready && !m.verified_mapping(1),
+              "source gap preserves configuration but revokes timing and observed evidence")
+        check(m.readiness_status_text.contains("重新同步") && !m.readiness_status_text.contains("0/3"),
+              "manual gap status requests input synchronization rather than mapping learning")
+        for n in 13...15 {
+            let time = UInt64(1_020_000+n*10_000)
+            m.ingest([input(UInt64(n),time)],gap:false,now:Int64(time))
+            _ = m.decide(observation(Int64(time)+5000),now:Int64(time)+5000,protected:0)
+        }
+        m.ingest([input(16,1_180_000,25,1)],gap:false,now:1_180_000)
+        check(m.decide(observation(1_185_000,25),now:1_185_000,protected:0)?.flags == target_flags[0]|8,
+              "ordinary input alone recovers manual repairs after a source gap")
+        mapping_edge(m,17,1_190_000,224,2,1,true)
+        check(m.manual_mapping_conflict && m.manual_mapping == configuration,
+              "reliable contradictory class suspends repairs without overwriting configuration")
+        m.ingest([input(18,1_200_000,25,1)],gap:false,now:1_200_000)
+        let blocked = m.decide(observation(1_205_000,25,held),now:1_205_000,protected:0)
+        check(blocked?.flags == held && blocked?.class_mask == 0 && blocked?.preserve_mask == 7,
+              "configuration conflict protects all classes across keyboard and legacy mouse merging")
+        m.window_clear(now:1_200_000); m.stream_clear(); m.clear()
+        check(m.manual_mapping_conflict && m.manual_mapping == configuration && m.mappings.count == 3,
+              "window, idle and service resets never silently dismiss a manual conflict")
+        let unpaired = m.decide(observation(1_205_000,25,held,"button"),now:1_205_000,protected:0)
+        check(unpaired?.flags == held && unpaired?.preserve_mask == 7,
+              "a conflict protects mouse flags even while timing is unavailable")
+        m.configure_mapping(configuration,now:1_210_000)
+        check(!m.manual_mapping_conflict && !m.ready && m.manual_mapping == configuration,
+              "explicit saving clears conflict and requires fresh calibration")
+        m.offset = 0; m.rtt = 1000; m.clock_at = 1_200_000
+        m.ingest([input(19,1_205_000,25,1)],gap:false,now:1_220_000)
+        check(m.decide(observation(1_220_000,25),now:1_220_000,protected:0) == nil && m.delays.isEmpty,
+              "delayed pre-configuration source input cannot calibrate new settings")
+        check(m.decide(observation(1_209_999,25),now:1_220_000,protected:0) == nil &&
+              m.last_decision_reason == "stale_configuration_observation",
+              "cached pre-configuration Mac observation is rejected")
+        m.configure_mapping(nil,now:1_230_000)
+        check(m.manual_mapping == nil && m.mappings.isEmpty && !m.manual_mapping_conflict,
+              "switching to automatic revokes manual assumptions")
+        let sided = manual_ready(PeerManualMapping(targets:[1,5,3])!)
+        sided.ingest([input(7,1_080_000,25,1|4|16)],gap:false,now:1_080_000)
+        let right_flags = target_flags[0]|16|target_flags[1]|64|target_flags[2]|8192
+        check(sided.decide(observation(1_085_000,25),now:1_085_000,protected:0)?.flags == right_flags,
+              "explicit right target sides produce their chosen device flags")
+        mapping_edge(sided,8,1_090_000,224,0,8,true)
+        check(sided.manual_mapping_conflict,"a reliable wrong target side also blocks manual repairs")
+        let optional_right = manual_ready(configuration)
+        optional_right.ingest([input(7,1_080_000,25,2)],gap:false,now:1_080_000)
+        let unknown = optional_right.decide(observation(1_085_000,25,held),now:1_085_000,protected:0)
+        check(unknown?.flags == held && unknown?.preserve_mask == 7,"unlearned right source still protects all target classes")
+        mapping_edge(optional_right,8,1_090_000,228,0,16,true)
+        mapping_edge(optional_right,9,1_100_000,228,0,16,false)
+        check(optional_right.verified_mapping(2) && !optional_right.manual_mapping_conflict,
+              "right source mappings can be learned alongside configured left sources")
+        // All 27 target-class combinations, including collisions and partial releases.
+        for a in 0..<3 { for b in 0..<3 { for c in 0..<3 {
+            let targets = [a*2,b*2,c*2]
+            let configured = PeerManualMapping(targets:targets)!
+            let combined = manual_ready(configured)
+            for state in 0..<8 {
+                let mods = UInt16((state & 1) | ((state & 2) << 1) | ((state & 4) << 2))
+                let time = UInt64(1_080_000+state*10_000)
+                let shift = CGEventFlags.maskShift.rawValue
+                combined.ingest([input(UInt64(7+state),time,25,mods)],gap:false,now:Int64(time))
+                var expected = shift
+                for (bit,mapping) in configured.mappings where mods & UInt16(bit) != 0 {
+                    expected |= target_flags[mapping.0]|mapping.1
+                }
+                check(combined.decide(observation(Int64(time)+5000,25,shift),now:Int64(time)+5000,protected:0)?.flags == expected,
+                      "manual target combination \(targets) active state \(state) preserves OR and Shift")
+            }
+        } } }
+        for protection: UInt8 in 0...7 {
+            let protected = manual_ready(configuration)
+            protected.ingest([input(7,1_080_000,25,1|4|16)],gap:false,now:1_080_000)
+            let decision = protected.decide(observation(1_085_000,25),now:1_085_000,protected:protection)
+            check(decision?.class_mask == 7 & ~protection && decision?.preserve_mask == protection,
+                  "manual mappings honor local-source protection mask \(protection)")
+        }
+    }
     static func main() throws {
+        manual_mappings()
         mapping_time_evidence()
         dynamic_mappings()
         future_source_boundaries()

@@ -5,7 +5,7 @@ import ApplicationServices
 import Carbon
 import Darwin
 
-let guard_version = "2026-10-01.10"
+let guard_version = "2026-10-01.11"
 let detailed_keyboard_diagnostics = CommandLine.arguments.contains("--diagnostic-session")
 let recovery_interval: UInt64 = 300_000_000
 let log_retention_seconds: TimeInterval = 3600
@@ -471,6 +471,138 @@ func input_source_preferences() -> UserDefaults {
     return UserDefaults(suiteName: domain) ?? UserDefaults.standard
 }
 
+// Parse only an integer property-list array; malformed stored values select automatic mode.
+func stored_manual_mapping(_ value: Any?) -> PeerManualMapping? {
+    guard let values = value as? [Any], values.count == 3 else { return nil }
+    var targets: [Int] = []
+    for value in values {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              !["f", "d"].contains(String(cString: number.objCType)),
+              (0...5).contains(number.intValue) else { return nil }
+        targets.append(number.intValue)
+    }
+    return PeerManualMapping(targets: targets)
+}
+
+final class MappingSettingsWindow: NSWindow {
+    override func cancelOperation(_ sender: Any?) { performClose(sender) }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+           event.charactersIgnoringModifiers?.lowercased() == "w" {
+            performClose(nil)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
+final class MappingSettingsController: NSWindowController {
+    private let mode = NSPopUpButton()
+    private var targets: [NSPopUpButton] = []
+    var mapping_provider: () -> PeerManualMapping? = { nil }
+    var mapping_handler: (PeerManualMapping?) -> Void = { _ in }
+
+    init(preview: Bool) {
+        let window = MappingSettingsWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 370),
+                                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = preview ? "修饰键映射设置（预览）" : "修饰键映射设置"
+        window.isReleasedWhenClosed = false
+        super.init(window: window)
+        guard let content = window.contentView else { return }
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 18
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 24)
+        ])
+        let heading = NSTextField(labelWithString: "Windows 控制 Mac 的修饰键映射")
+        heading.font = .boldSystemFont(ofSize: 16)
+        stack.addArrangedSubview(heading)
+        let hint = NSTextField(wrappingLabelWithString: "请按 UU 远程实际设置填写三个映射。通常选择 Mac 左侧按键；Windows 右侧修饰键继续自动验证。")
+        hint.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(hint)
+        hint.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        mode.addItems(withTitles: ["自动学习", "手动配置"])
+        mode.target = self
+        mode.action = #selector(mode_changed)
+        mode.setAccessibilityLabel("映射模式")
+        stack.addArrangedSubview(row(label: "映射模式", control: mode))
+        let labels = ["Windows 左 Ctrl", "Windows 左 Win", "Windows 左 Alt"]
+        let names = PeerManualMapping.target_names
+        for label in labels {
+            let popup = NSPopUpButton()
+            popup.addItems(withTitles: names)
+            popup.setAccessibilityLabel(label + " 映射到 Mac 按键")
+            targets.append(popup)
+            stack.addArrangedSubview(row(label: label, control: popup))
+        }
+        let buttons = NSStackView()
+        buttons.orientation = .horizontal
+        buttons.spacing = 12
+        let restore = NSButton(title: "恢复默认", target: self, action: #selector(restore_defaults))
+        let cancel = NSButton(title: "取消", target: self, action: #selector(cancel))
+        let save = NSButton(title: "保存", target: self, action: #selector(save))
+        save.keyEquivalent = "\r"
+        buttons.addArrangedSubview(restore)
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        buttons.addArrangedSubview(spacer)
+        buttons.addArrangedSubview(cancel)
+        buttons.addArrangedSubview(save)
+        stack.addArrangedSubview(buttons)
+        buttons.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        window.center()
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    private func row(label: String, control: NSPopUpButton) -> NSStackView {
+        let field = NSTextField(labelWithString: label)
+        field.widthAnchor.constraint(equalToConstant: 170).isActive = true
+        control.widthAnchor.constraint(equalToConstant: 270).isActive = true
+        let row = NSStackView(views: [field, control])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 16
+        return row
+    }
+
+    func open_settings() {
+        let configuration = mapping_provider()
+        mode.selectItem(at: configuration == nil ? 0 : 1)
+        let values = (configuration ?? PeerManualMapping.default_mapping).targets
+        for (index, target) in targets.enumerated() { target.selectItem(at: values[index]) }
+        mode_changed()
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func mode_changed() {
+        for target in targets { target.isEnabled = mode.indexOfSelectedItem == 1 }
+    }
+    @objc private func restore_defaults() {
+        mode.selectItem(at: 1)
+        for (index, target) in targets.enumerated() {
+            target.selectItem(at: PeerManualMapping.default_mapping.targets[index])
+        }
+        mode_changed()
+    }
+    @objc private func cancel() { window?.performClose(nil) }
+    @objc private func save() {
+        let configuration = mode.indexOfSelectedItem == 1
+            ? PeerManualMapping(targets: targets.map { $0.indexOfSelectedItem }) : nil
+        mapping_handler(configuration)
+        window?.performClose(nil)
+    }
+}
+
 struct InputSourceInfo {
     let identifier: String
     let bundle_identifier: String
@@ -648,6 +780,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let log_directory: URL
     private let preview: Bool
     private var refresh_timer: Timer?
+    private var mapping_settings: MappingSettingsController?
     var snapshot_provider: () -> MenuSnapshot = { MenuSnapshot() }
     var retry_handler: () -> Void = {}
     var quit_handler: () -> Void = {}
@@ -657,6 +790,8 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var peer_handler: () -> Void = {}
     var peer_ip_provider: () -> String = { "" }
     var peer_ip_handler: (String) -> String? = { _ in nil }
+    var mapping_provider: () -> PeerManualMapping? = { nil }
+    var mapping_handler: (PeerManualMapping?) -> Void = { _ in }
     var export_provider: () -> [String: Any] = { [:] }
     private let export_queue = DispatchQueue(label: "uu-command-guard.export")
 
@@ -698,6 +833,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(peer_item)
         menu.addItem(peer_counts_item)
         add_action("设置 Windows IP…", #selector(configure_peer))
+        add_action("修饰键映射设置…", #selector(open_mapping_settings))
         add_action("导出最近两分钟诊断…", #selector(export_diagnostics))
         menu.addItem(.separator())
         retry_item.target = self
@@ -756,6 +892,18 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func retry_start() { retry_handler(); refresh() }
     @objc private func toggle_input_source() { input_source_handler(); refresh() }
     @objc private func toggle_peer() { peer_handler(); refresh() }
+    @objc func open_mapping_settings() {
+        if mapping_settings == nil {
+            let settings = MappingSettingsController(preview: preview)
+            settings.mapping_provider = { [weak self] in self?.mapping_provider() }
+            settings.mapping_handler = { [weak self] configuration in
+                self?.mapping_handler(configuration)
+                self?.refresh()
+            }
+            mapping_settings = settings
+        }
+        mapping_settings?.open_settings()
+    }
     @objc private func configure_peer() {
         let alert = NSAlert()
         alert.messageText = "设置 Windows 对端 IP"
@@ -804,11 +952,16 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
     @objc private func quit() { quit_handler() }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if preview { open_mapping_settings() }
+        return true
+    }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         quit_handler()
         return .terminateCancel
     }
     func close() {
+        mapping_settings?.close()
         refresh_timer?.invalidate()
         NSStatusBar.system.removeStatusItem(status_item)
     }
@@ -1080,6 +1233,13 @@ func self_test() throws {
     let preferences = input_source_preferences()
     check(Bundle.main.bundleIdentifier != "local.uu-command-guard" || preferences === UserDefaults.standard,
           "bundled startup uses standard preferences without an invalid self suite")
+    check(stored_manual_mapping(nil) == nil, "absent manual mapping selects automatic mode")
+    check(stored_manual_mapping([0, 4, 2]) == PeerManualMapping.default_mapping, "default manual mapping preference parses")
+    check(stored_manual_mapping([1, 5, 3])?.targets == [1, 5, 3], "right target choices parse")
+    check(stored_manual_mapping([0, 0, 0])?.targets == [0, 0, 0], "many-to-one preference parses")
+    for value: Any in [[0, 4], [0, 4, 2, 1], [0, 6, 2], [-1, 4, 2], [true, 4, 2], [0.5, 4.0, 2.0], ["0", "4", "2"]] {
+        check(stored_manual_mapping(value) == nil, "malformed manual mapping selects automatic mode")
+    }
     let memory_log = DiagnosticLog(row_limit: 2, byte_limit: 4096)
     memory_log.record("old", now: 0)
     memory_log.record("recent", now: 100)
@@ -1173,6 +1333,30 @@ func self_test() throws {
         for entry in batch { entry.body() }
         check(!overflow && !future_peer.ready,"queued revocation is applied before input correction")
     } else { check(false,"bounded queued revocation must be available without waiting") }
+    let manual_peer = PeerMatcher()
+    manual_peer.offset = 0; manual_peer.rtt = 1000; manual_peer.clock_at = 1_000_000
+    manual_peer.configure_mapping(.default_mapping)
+    check(!manual_peer.ready && manual_peer.manual_mapping == .default_mapping,
+          "manual configuration does not prove input readiness")
+    manual_peer.learned_window = "manual-window"; manual_peer.delays = [5000,5000,5000]
+    manual_peer.ingest([PeerInput(id:1,time_us:1_010_000,window:"manual-window",kind:"key",key:25,action:"down",mods:1)],gap:false,now:1_010_000)
+    let manual_flags = modifier_specs[0].aggregate|8
+    let manual_decision = manual_peer.decide(PeerObservation(time:1_015_000,kind:"key",key:25,action:"down",flags:0),now:1_015_000,protected:0)
+    check(manual_decision?.flags == manual_flags && manual_decision?.class_mask == 7,
+          "explicit left mapping repairs ordinary shortcuts without mapping learning")
+    check(!manual_peer.verified_mapping(1),"configured mapping is not diagnostic verification")
+    manual_peer.ingest([],gap:true,now:1_020_000)
+    check(!manual_peer.ready && manual_peer.manual_mapping == .default_mapping && manual_peer.mappings.count == 3,
+          "source interruption retains settings while invalidating input evidence")
+    check(!manual_peer.readiness_status_text.contains("0/3"),"manual status never requests mapping relearning")
+    manual_peer.ingest([PeerInput(id:2,time_us:1_030_000,window:"manual-window",kind:"modifier",key:224,action:"down",mods:1)],gap:false,now:1_030_000)
+    _ = manual_peer.decide(PeerObservation(time:1_035_000,kind:"modifier",key:0,action:"down",flags:modifier_specs[2].aggregate|1,modifier_class:2,side_bit:1),now:1_035_000,protected:0)
+    check(manual_peer.manual_mapping_conflict,"reliable contradictory configured edge latches conflict")
+    let conflict_mouse = manual_peer.decide(PeerObservation(time:1_040_000,kind:"button",key:1,action:"down",flags:manual_flags),now:1_040_000,protected:0)
+    check(merge_remote_mouse_flags(offline_flags:0,correction:conflict_mouse) == manual_flags,
+          "unmatched mouse retains original flags across offline merging during conflict")
+    manual_peer.configure_mapping(nil,now:1_045_000)
+    check(manual_peer.mappings.isEmpty && !manual_peer.manual_mapping_conflict,"automatic mode revokes manual assumptions")
     print("PASS: \(checks) state/reconnect/log/input-source checks; no input taps created, input sources selected or events posted")
 }
 
@@ -1184,8 +1368,10 @@ if CommandLine.arguments.contains("--version") { print(guard_version); exit(0) }
 let executable_url = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.resolvingSymlinksInPath()
 let is_app_bundle = Bundle.main.bundleIdentifier == "local.uu-command-guard"
 let menu_bar_mode = !CommandLine.arguments.contains("--clean-logs") && (is_app_bundle
-    || CommandLine.arguments.contains("--menu-bar") || CommandLine.arguments.contains("--menu-bar-preview"))
+    || CommandLine.arguments.contains("--menu-bar") || CommandLine.arguments.contains("--menu-bar-preview")
+    || CommandLine.arguments.contains("--mapping-settings-preview"))
 let preview_mode = CommandLine.arguments.contains("--menu-bar-preview")
+    || CommandLine.arguments.contains("--mapping-settings-preview")
 let support_directory = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Application Support/UUCommandGuard")
 let legacy_directory = is_app_bundle
@@ -1198,7 +1384,11 @@ if preview_mode {
     let controller = MenuBarController(log_directory: log_directory, preview: true)
     controller.snapshot_provider = { MenuSnapshot(failure: "预览模式：未创建输入监听") }
     controller.quit_handler = { controller.close(); _exit(0) }
+    var preview_mapping: PeerManualMapping? = PeerManualMapping.default_mapping
+    controller.mapping_provider = { preview_mapping }
+    controller.mapping_handler = { preview_mapping = $0 }
     controller.refresh()
+    if CommandLine.arguments.contains("--mapping-settings-preview") { controller.open_mapping_settings() }
     NSApplication.shared.run()
     _exit(0)
 }
@@ -1527,6 +1717,7 @@ func configure_remote_peer() -> String? {
         return nil
     } catch { return error.localizedDescription }
 }
+remote_peer.configure_mapping(stored_manual_mapping(input_preferences.array(forKey: "remote_manual_mapping")))
 if let error = configure_remote_peer() { logger.notice(error) }
 if menu_bar_mode {
     let controller = MenuBarController(log_directory: log_directory)
@@ -1554,6 +1745,15 @@ if menu_bar_mode {
         let enabled = (input_preferences.object(forKey: "remote_peer_enabled") as? Bool) ?? true
         input_preferences.set(!enabled, forKey: "remote_peer_enabled")
         if let error = configure_remote_peer() { logger.notice(error) }
+    }
+    controller.mapping_provider = { remote_peer.manual_mapping }
+    controller.mapping_handler = { configuration in
+        if let configuration = configuration {
+            input_preferences.set(configuration.targets, forKey: "remote_manual_mapping")
+        } else {
+            input_preferences.removeObject(forKey: "remote_manual_mapping")
+        }
+        remote_peer.configure_mapping(configuration)
     }
     controller.peer_ip_provider = { input_preferences.string(forKey: "remote_peer_ip") ?? "" }
     controller.peer_ip_handler = { address in

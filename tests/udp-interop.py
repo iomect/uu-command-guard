@@ -8,6 +8,7 @@ import tempfile
 
 project = Path(__file__).resolve().parents[1]
 driver = r'''
+let fixture_manual_mode = __MANUAL_MODE__
 let fixture_target_flag = __TARGET_FLAG__
 let fixture_left_side: UInt64 = __LEFT_SIDE__
 let fixture_right_side: UInt64 = __RIGHT_SIDE__
@@ -18,6 +19,70 @@ let fixture_scope_reset_file = "__SCOPE_RESET_FILE__"
 let fixture_scope_resume_file = "__SCOPE_RESUME_FILE__"
 let fixture_target_name = "__TARGET_NAME__"
 extension RemotePeerBridge {
+    func check_manual_fixture_configuration() {
+        guard fixture_manual_mode else { return }
+        precondition(manual_mapping == PeerManualMapping.default_mapping,
+                     "manual mapping did not survive the input boundary")
+        precondition(!matcher.readiness_status_text.contains("0/3"),
+                     "manual configuration returned to automatic mapping learning")
+    }
+    func check_manual_conflict_early_returns() {
+        guard fixture_manual_mode else { return }
+        let now = Int64(peer_now_us())
+        let fixture_window = matcher.learned_window ?? "manual-conflict-fixture"
+        matcher.stream_clear(now: now - 1)
+        matcher.offset = 0; matcher.rtt = 1000; matcher.clock_at = now
+        matcher.learned_window = fixture_window; matcher.delays = [0,0,0]; matcher.ordinary_pair = true
+        let source_id = max(matcher.highest_id, max(matcher.last_consumed_id, matcher.mapping_source_watermark)) + 1
+        matcher.ingest([PeerInput(id: source_id, time_us: UInt64(now), window: fixture_window,
+                                  kind: "modifier", key: 224, action: "down", mods: 1)], gap: false, now: now)
+        let conflicting_flags = CGEventFlags.maskControl.rawValue | 1
+        let modifier = PeerObservation(time: now, kind: "modifier", key: 0, action: "down",
+                                       flags: conflicting_flags, modifier_class: 2, side_bit: 1)
+        precondition(matcher.decide(modifier, now: now, protected: 0) == nil,
+                     "flagsChanged conflict evidence must stay observation only")
+        precondition(matcher.manual_mapping_conflict, "reliable configured Ctrl-to-Control conflict did not latch")
+        let original_flags = CGEventFlags.maskCommand.rawValue | CGEventFlags.maskAlternate.rawValue
+            | CGEventFlags.maskControl.rawValue | CGEventFlags.maskShift.rawValue | 8 | 32 | 1
+        func check_preserved(_ type: CGEventType, _ label: String, prepare: (CGEvent) -> Void = { _ in }) {
+            let event = CGEvent(source: nil)!
+            event.type = type; event.timestamp = peer_now_us() * 1000
+            event.flags = CGEventFlags(rawValue: original_flags)
+            prepare(event)
+            let original_time = event.timestamp
+            let original_key = event.getIntegerValueField(.keyboardEventKeycode)
+            let decision = observe(type: type, event: event, now_ns: peer_now_us() * 1000, protected_mask: 0)
+            guard let decision = decision else { preconditionFailure("conflict protection returned nil: " + label) }
+            precondition(decision.flags == original_flags && decision.class_mask == 0 && decision.preserve_mask == 7,
+                         "conflict early-return protection failed: " + label)
+            precondition(event.type == type && event.timestamp == original_time
+                         && event.getIntegerValueField(.keyboardEventKeycode) == original_key && event.flags.rawValue == original_flags,
+                         "conflict protection mutated the in-memory event: " + label)
+        }
+        check_preserved(.leftMouseDown, "invalid mouse timestamp") { $0.timestamp = 0 }
+        check_preserved(.scrollWheel, "unsupported two-axis scroll") {
+            $0.setIntegerValueField(.scrollWheelEventDeltaAxis1, value: 1)
+            $0.setIntegerValueField(.scrollWheelEventDeltaAxis2, value: 1)
+        }
+        matcher.offset = nil
+        check_preserved(.leftMouseDown, "unhealthy clock and unmatched button")
+        matcher.offset = 0; matcher.clock_at = Int64(peer_now_us())
+        check_preserved(.keyDown, "unsupported ordinary physical key") {
+            $0.setIntegerValueField(.keyboardEventKeycode, value: 255)
+        }
+        var applied_publications = 0
+        for _ in 0..<9 { _ = publications.append { applied_publications += 1 } }
+        check_preserved(.leftMouseDown, "publication backlog")
+        precondition(applied_publications == 0, "input callback partially consumed the publication backlog")
+        let event = CGEvent(source: nil)!
+        event.type = .flagsChanged; event.timestamp = peer_now_us() * 1000
+        event.setIntegerValueField(.keyboardEventKeycode, value: 55)
+        event.flags = CGEventFlags(rawValue: CGEventFlags.maskCommand.rawValue | 8)
+        precondition(observe(type: .flagsChanged, event: event, now_ns: peer_now_us() * 1000, protected_mask: 0) == nil,
+                     "flagsChanged must remain observation only during a configured mapping conflict")
+        precondition(manual_mapping == PeerManualMapping.default_mapping, "conflict altered the saved manual mapping")
+        print("PASS: manual conflict preserves all three classes across invalid timestamps, two-axis scroll, unhealthy clock, unsupported keys and publication backlog; flagsChanged stays observation only")
+    }
     func feed_fixture_events(_ seen: inout Set<UInt64>, corrections: inout Int) {
         guard matcher.healthy(Int64(peer_now_us())) else { return }
         for source in matcher.source.sorted(by: { $0.id < $1.id }) where !seen.contains(source.id) {
@@ -65,7 +130,9 @@ extension RemotePeerBridge {
     }
 }
 let bridge = RemotePeerBridge(status_notice: { _ in }, local_port: 47733, peer_port: 47732)
+if fixture_manual_mode { bridge.configure_mapping(PeerManualMapping.default_mapping) }
 try bridge.configure(peer_ip: "127.0.0.1", enabled: true)
+bridge.check_manual_fixture_configuration()
 var seen: Set<UInt64> = []
 var corrections = 0
 let start = peer_now_us()
@@ -87,6 +154,7 @@ for source_name in ["左Ctrl", "右Ctrl"] {
                  "real source modifier did not prove its configured target class")
 }
 precondition(corrections > 0, "real cross-language packets did not repair a keyboard event")
+bridge.check_manual_fixture_configuration()
 try Data().write(to: URL(fileURLWithPath: fixture_scope_reset_file))
 let scope_deadline = peer_now_us() + 2_000_000
 while peer_now_us() < scope_deadline && bridge.diagnostic_summary()["window_learned"] as? Bool == true {
@@ -94,6 +162,7 @@ while peer_now_us() < scope_deadline && bridge.diagnostic_summary()["window_lear
 }
 precondition(bridge.diagnostic_summary()["window_learned"] as? Bool == false && bridge.diagnostic_summary()["verified_modifier_sides"] as? Int == 0,
              "leaving the same remote window scope did not revoke learned mappings")
+bridge.check_manual_fixture_configuration()
 try Data().write(to: URL(fileURLWithPath: fixture_scope_resume_file))
 let resume_deadline = peer_now_us() + 5_000_000
 let previous_corrections = corrections
@@ -107,19 +176,23 @@ while peer_now_us() < resume_deadline {
 }
 precondition(bridge.diagnostic_summary()["window_learned"] as? Bool == true && bridge.diagnostic_summary()["verified_modifier_sides"] as? Int == 2 && corrections > previous_corrections,
              "same-window scope return failed to prove mappings and correct new keyboard input")
+bridge.check_manual_fixture_configuration()
 RunLoop.main.run(until: Date().addingTimeInterval(2.5))
+bridge.check_manual_conflict_early_returns()
 bridge.stop()
 RunLoop.main.run(until: Date().addingTimeInterval(0.05))
 print("PASS: Swift decoded real Go packets, clock calibrated, both Ctrl sides verified, keyboard flags repaired, window learned, scope exit revoked mappings, scope return relearned and idle stopped; no input taps or posted events")
 '''
 configurations = [
-    dict(TARGET_NAME="Command", TARGET_MASK="1", TARGET_FLAG="CGEventFlags.maskCommand.rawValue",
+    dict(MANUAL_MODE="false", TARGET_NAME="Command", TARGET_MASK="1", TARGET_FLAG="CGEventFlags.maskCommand.rawValue",
          LEFT_SIDE="8", RIGHT_SIDE="16", LEFT_KEY="55", RIGHT_KEY="54"),
-    dict(TARGET_NAME="Control", TARGET_MASK="4", TARGET_FLAG="CGEventFlags.maskControl.rawValue",
+    dict(MANUAL_MODE="false", TARGET_NAME="Control", TARGET_MASK="4", TARGET_FLAG="CGEventFlags.maskControl.rawValue",
          LEFT_SIDE="1", RIGHT_SIDE="8192", LEFT_KEY="59", RIGHT_KEY="62"),
+    dict(MANUAL_MODE="true", TARGET_NAME="Command", TARGET_MASK="1", TARGET_FLAG="CGEventFlags.maskCommand.rawValue",
+         LEFT_SIDE="8", RIGHT_SIDE="16", LEFT_KEY="55", RIGHT_KEY="54"),
 ]
 for configuration in configurations:
-    print("Real UDP fixture target:", configuration["TARGET_NAME"], flush=True)
+    print("Real UDP fixture target:", configuration["TARGET_NAME"], "manual:", configuration["MANUAL_MODE"], flush=True)
     with tempfile.TemporaryDirectory(prefix="uu-udp-interop-") as folder:
         source = Path(folder) / "main.swift"
         binary = Path(folder) / "swift-peer"

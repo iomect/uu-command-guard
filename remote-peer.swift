@@ -42,12 +42,31 @@ let peer_modifier_sides: [(bit: Int, name: String)] = [
     (1,"左Ctrl"),(2,"右Ctrl"),(4,"左Win"),(8,"右Win"),(16,"左Alt"),(32,"右Alt")
 ]
 let peer_required_modifier_sides = peer_modifier_sides.filter { $0.bit & (1 | 4 | 16) != 0 }
+// Explicit class and device-side choices for the three left Windows modifiers.
+// Right source keys remain independently learned; configuration is never input history.
+struct PeerManualMapping: Equatable {
+    let targets: [Int]
+    let mappings: [Int:(Int,UInt64)]
+    static let target_names = ["Command（左侧）","Command（右侧）","Option（左侧）","Option（右侧）","Control（左侧）","Control（右侧）"]
+    static let default_mapping = PeerManualMapping(targets:[0,4,2])!
+    init?(targets: [Int]) {
+        guard targets.count == 3, targets.allSatisfy({ (0..<6).contains($0) }) else { return nil }
+        self.targets = targets
+        let sides: [UInt64] = [8,16,32,64,1,8192]
+        self.mappings = Dictionary(uniqueKeysWithValues:zip([1,4,16],targets).map { ($0.0,($0.1/2,sides[$0.1])) })
+    }
+    static func == (lhs: PeerManualMapping, rhs: PeerManualMapping) -> Bool { lhs.targets == rhs.targets }
+}
 final class PeerMatcher {
     var source: [PeerInput] = []; var observations: [PeerObservation] = []
     var consumed: [UInt64:Int64] = [:]; var last_consumed_id: UInt64 = 0; var learned_window: String?
     var offset: Double?; var rtt: Double = .infinity; var clock_at: Int64 = 0
     var delays: [Int64] = []; var ordinary_pair = false
     var mappings: [Int: (Int, UInt64)] = [:]
+    private(set) var manual_mapping: PeerManualMapping?
+    private(set) var manual_mapping_conflict = false
+    private var manual_verified: Set<Int> = []
+    private var configuration_boundary: Int64 = 0
     var mapping_edges: [Int: (Int, UInt64, UInt8)] = [:]
     var mapping_evidence: [Int: (UInt64, Int64)] = [:]
     var mapping_source_watermark: UInt64 = 0
@@ -69,10 +88,22 @@ final class PeerMatcher {
         guard let mapping = mapping, aggregate.indices.contains(mapping.0), mapping.1 != 0 else { return false }
         return mapping.1 & devices[mapping.0] == mapping.1 && mapping.1 & (mapping.1-1) == 0
     }
+    func configure_mapping(_ configuration: PeerManualMapping?, now: Int64 = 0) {
+        manual_mapping = configuration
+        manual_mapping_conflict = false
+        configuration_boundary = now
+        last_consumed_id = max(last_consumed_id,max(highest_id,source.map(\.id).max() ?? 0))
+        window_clear(now:now)
+    }
+    func verified_mapping(_ bit: Int) -> Bool {
+        !manual_mapping_conflict && valid_mapping(mappings[bit]) && (manual_mapping?.mappings[bit] == nil || manual_verified.contains(bit))
+    }
     var unverified_modifier_names: [String] {
         peer_required_modifier_sides.filter { !valid_mapping(mappings[$0.bit]) }.map(\.name)
     }
     var mapping_status_text: String {
+        if manual_mapping_conflict { return "映射配置与 UU 实际按键冲突，已暂停修正，请检查映射设置" }
+        if manual_mapping != nil { return "辅助同步中，使用手动修饰键映射" }
         let pending = unverified_modifier_names
         if !pending.isEmpty { return "辅助同步中，左侧修饰键映射待验证（\(3-pending.count)/3）：\(pending.joined(separator:"、"))" }
         let names = ["Command","Option","Control"]
@@ -80,7 +111,9 @@ final class PeerMatcher {
         return "辅助同步中，左侧修饰键映射已验证（3/3）：\(relationships.joined(separator:"、"))"
     }
     var readiness_status_text: String {
-        ready ? mapping_status_text : "辅助同步中，正在重新学习远程窗口（左侧修饰键映射\(3-unverified_modifier_names.count)/3）"
+        if manual_mapping_conflict { return mapping_status_text }
+        if manual_mapping != nil { return ready ? mapping_status_text : "手动映射已保存，正在重新同步远程输入" }
+        return ready ? mapping_status_text : "辅助同步中，正在重新学习远程窗口（左侧修饰键映射\(3-unverified_modifier_names.count)/3）"
     }
     func modifier_mapping_diagnostic() -> [[String:Any]] {
         peer_modifier_sides.map { side in
@@ -91,7 +124,8 @@ final class PeerMatcher {
             let matched_edges = edges?.2 ?? 0
             return ["source_modifier":side.name,"target_modifier":target_name,
                     "required":peer_required_modifier_sides.contains { $0.bit == side.bit },
-                    "verified":valid_mapping(confirmed),
+                    "configured":manual_mapping?.mappings[side.bit] != nil,
+                    "verified":verified_mapping(side.bit),
                     "matched_down":matched_edges & 1 != 0,"matched_up":matched_edges & 2 != 0]
         }
     }
@@ -99,11 +133,12 @@ final class PeerMatcher {
         unverified_modifier_names.isEmpty || mappings.values.contains { valid_mapping($0) && $0.0 == index }
     }
     private func reset_mapping_evidence(now: Int64, revoke: Bool) {
+        let verified = mappings.filter { verified_mapping($0.key) }
         mapping_source_watermark = max(mapping_source_watermark,max(last_consumed_id,max(highest_id,source.map(\.id).max() ?? 0)))
         mapping_observation_watermark = max(mapping_observation_watermark,max(now,observations.map(\.time).max() ?? 0))
         mapping_evidence.removeAll(); mapping_edges.removeAll()
-        if revoke { mappings.removeAll() }
-        else { for (bit,mapping) in mappings { mapping_edges[bit] = (mapping.0,mapping.1,3) } }
+        if revoke { mappings = manual_mapping?.mappings ?? [:]; manual_verified.removeAll() }
+        else { for (bit,mapping) in verified { mapping_edges[bit] = (mapping.0,mapping.1,3) } }
     }
     func clear(keep_consumed: Bool = true, now: Int64 = 0) {
         reset_mapping_evidence(now:now,revoke:true)
@@ -147,6 +182,7 @@ final class PeerMatcher {
     func candidates(_ observation: PeerObservation, now: Int64) -> [PeerInput] {
         source.filter { event in
             guard event.id > last_consumed_id, consumed[event.id] == nil, compatible(event, observation), learned_window == nil || event.window == learned_window else { return false }
+            guard mapped(event.time_us) > configuration_boundary else { return false }
             if observation.kind == "modifier" && event.id <= mapping_source_watermark { return false }
             let difference = observation.time - mapped(event.time_us)
             if ready { return abs(Double(difference) - Double(delay())) <= 25_000 + rtt/2 }
@@ -155,6 +191,7 @@ final class PeerMatcher {
     }
     func pair(_ observation: PeerObservation, now: Int64) -> PeerInput? {
         guard healthy(now) else { last_pair_reason = "clock_unhealthy"; return nil }
+        guard observation.time > configuration_boundary else { last_pair_reason = "stale_configuration_observation"; return nil }
         guard hole_since == nil else { last_pair_reason = "sequence_hole"; return nil }
         guard observation.kind != "motion" else { last_pair_reason = "motion_not_paired"; return nil }
         guard observation.kind != "modifier" || observation.time > mapping_observation_watermark else { last_pair_reason = "stale_mapping_observation"; return nil }
@@ -200,10 +237,16 @@ final class PeerMatcher {
         if let evidence = mapping_evidence[key], event.id <= evidence.0 || observation.time <= evidence.1 { return }
         let prior = mapping_edges[key]
         let known = mappings[key].map { ($0.0,$0.1) } ?? prior.map { ($0.0,$0.1) }
+        if let configured = manual_mapping?.mappings[key], configured.0 != index || configured.1 != side {
+            // Never reinterpret a user setting from one observed edge. Stop repairs
+            // until the user explicitly saves a corrected configuration.
+            manual_mapping_conflict = true
+            return
+        }
         if let known = known, known.0 != index || known.1 != side {
             // A reliable conflicting edge changes the whole configuration. Its opposite
             // edge must come from newer source and Mac observations, never old history.
-            mappings.removeAll(); mapping_edges.removeAll(); mapping_evidence.removeAll()
+            mappings = manual_mapping?.mappings ?? [:]; mapping_edges.removeAll(); mapping_evidence.removeAll(); manual_verified.removeAll()
             mapping_source_watermark = max(mapping_source_watermark,event.id)
             mapping_observation_watermark = max(mapping_observation_watermark,observation.time)
         }
@@ -212,11 +255,14 @@ final class PeerMatcher {
         let combined: UInt8
         if down { combined = 1 }
         else if current?.0 == index && current?.1 == side && current?.2 == 1 { combined = 3 }
-        else if valid_mapping(mappings[key]) { combined = 3 }
+        else if verified_mapping(key) { combined = 3 }
         else { combined = edge }
         mapping_edges[key] = (index,side,combined)
         mapping_evidence[key] = (event.id,observation.time)
-        if combined == 3 { mappings[key] = (index,side) }
+        if combined == 3 {
+            mappings[key] = (index,side)
+            if manual_mapping?.mappings[key] != nil { manual_verified.insert(key) }
+        }
     }
     func bit(_ key: Int) -> UInt16 {
         switch key { case 224:return 1;case 228:return 2;case 227:return 4;case 231:return 8;case 226:return 16;case 230:return 32;default:return 0 }
@@ -313,6 +359,11 @@ final class PeerMatcher {
             if observations.count > 512 { observations.removeFirst(); continuity = false; transitions.removeAll() }
         }
         if observation.kind == "modifier" { last_decision_reason = "modifier_observation"; skipped &+= 1; return nil }
+        if manual_mapping_conflict {
+            last_decision_reason = "manual_mapping_conflict"
+            skipped &+= 1
+            return RemoteFlagDecision(flags:observation.flags,class_mask:0,preserve_mask:7)
+        }
         guard let state = mods else { skipped &+= 1; return nil }
         let active_unknown = peer_modifier_sides.filter { state & UInt16($0.bit) != 0 && !valid_mapping(mappings[$0.bit]) }
         if !active_unknown.isEmpty {
@@ -424,7 +475,17 @@ final class RemotePeerBridge {
     var status_text: String { status_value }
     var corrected_count: UInt64 { matcher.corrected }
     var skipped_count: UInt64 { matcher.skipped }
+    var manual_mapping: PeerManualMapping? { matcher.manual_mapping }
     var keyboard_decision_reason: String { last_keyboard_decision["reason"] as? String ?? "not_attempted" }
+    func configure_mapping(_ configuration: PeerManualMapping?) {
+        _ = drain_publications()
+        matcher.configure_mapping(configuration,now:Int64(peer_now_us()))
+        binding_requested = ""
+        if main_enabled {
+            status_value = matcher.readiness_status_text
+            notice(status_value)
+        }
+    }
     init(status_notice: @escaping (String)->Void, local_port: UInt16 = 47731, peer_port: UInt16 = 47731) {
         notice = status_notice; self.local_port = local_port; self.peer_port = peer_port
         let source = DispatchSource.makeUserDataOrSource(queue: queue)
@@ -664,10 +725,11 @@ final class RemotePeerBridge {
         guard let learned = matcher.learned_window, binding_requested != learned else { return }
         binding_requested = learned
         let requested_epoch = cache_epoch
+        let manual = matcher.manual_mapping != nil
         queue.async { [weak self] in
             guard let self = self, self.active, self.epoch == requested_epoch, self.bound_window != learned else { return }
             self.bound_window = learned; var p = self.packet("bind"); p.window = learned; self.send(p)
-            self.status("远程窗口已学习，等待修饰键映射验证")
+            self.status(manual ? "远程输入已同步，使用手动修饰键映射" : "远程窗口已学习，等待修饰键映射验证")
         }
     }
     private func activity() {
@@ -688,6 +750,16 @@ final class RemotePeerBridge {
         }
     }
     func observe(type:CGEventType,event:CGEvent,now_ns:UInt64,protected_mask:UInt8) -> RemoteFlagDecision? {
+        let decision = observe_input(type:type,event:event,now_ns:now_ns,protected_mask:protected_mask)
+        // Even a rejected/unmatched event must preserve flags across the offline
+        // mouse path while an explicit configuration conflict is latched.
+        if main_enabled, matcher.manual_mapping_conflict, type != .flagsChanged {
+            update_mapping_status()
+            return RemoteFlagDecision(flags:event.flags.rawValue,class_mask:0,preserve_mask:7)
+        }
+        return decision
+    }
+    private func observe_input(type:CGEventType,event:CGEvent,now_ns:UInt64,protected_mask:UInt8) -> RemoteFlagDecision? {
         guard main_enabled else { return nil }
         let now = now_ns/1000
         activity_source?.or(data: 1)
@@ -801,10 +873,13 @@ final class RemotePeerBridge {
     }
     func diagnostic_summary()->[String:Any] {
         ["status":status_value,"corrected":matcher.corrected,"skipped":matcher.skipped,
-         "window_learned":matcher.ready,"verified_modifier_sides":matcher.mappings.count,
+         "window_learned":matcher.ready,"verified_modifier_sides":peer_modifier_sides.filter { matcher.verified_mapping($0.bit) }.count,
+         "mapping_mode":matcher.manual_mapping == nil ? "automatic" : "manual",
+         "manual_mapping_conflict":matcher.manual_mapping_conflict,
          "required_modifiers":peer_required_modifier_sides.map(\.name),"required_modifier_sides":3,
-         "verified_required_modifier_sides":3-matcher.unverified_modifier_names.count,
-         "unverified_modifiers":matcher.unverified_modifier_names,"modifier_mapping_details":matcher.modifier_mapping_diagnostic(),
+         "verified_required_modifier_sides":peer_required_modifier_sides.filter { matcher.verified_mapping($0.bit) }.count,
+         "unverified_modifiers":peer_required_modifier_sides.filter { !matcher.verified_mapping($0.bit) }.map(\.name),
+         "modifier_mapping_details":matcher.modifier_mapping_diagnostic(),
          "keyboard_decisions":keyboard_decisions,"last_keyboard_decision":last_keyboard_decision,
          "late_keyboard_calibrations":matcher.late_keyboard_calibrations,
          "future_tolerance_accepts":matcher.future_tolerance_accepts,
