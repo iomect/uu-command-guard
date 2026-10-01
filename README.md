@@ -52,7 +52,7 @@ xattr -cr "/Applications/UU 修补工具.app"
 
 两端一直等待连接且 Mac 提示“UDP发送失败：网络不可达（errno 65）”时，检查“系统设置 → 隐私与安全性 → 本地网络”。若本工具已允许访问，可将其开关关闭再打开，然后从工具菜单完全退出并重新启动；有多条同名记录时检查每条。错误 65 表示目标不可达，也需检查实际 IP 和网络，不能仅凭该错误认定权限被拒绝。网络诊断包含发送/接收错误码及固定分类计数，不包含地址或报文。
 
-macOS 没有受支持的本地网络权限单项重置方法，多版本或临时签名可能影响身份识别；删除旧应用副本不保证移除旧权限记录，见 [Apple 技术说明](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)。
+macOS 没有受支持的本地网络权限单项重置方法，多版本或临时签名可能影响身份识别；删除旧应用副本不保证移除旧权限记录，见 [Apple 技术说明](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)。 临时签名的默认身份绑定当前代码哈希，更新后会改变；固定应用名或 bundle ID 不能可靠保持跨版本授权，见 [Apple 签名说明](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)。
 
 设置仅在保存时写入：Mac 使用 `local.uu-command-guard` 偏好域，Windows 使用 `%LOCALAPPDATA%\UUCommandBridge\config.json`。映射窗口的“恢复默认”仅修改表单，保存才生效；取消、关闭不会修改配置。诊断区分手动配置、实际验证及冲突状态，不把已配置显示成已验证。
 
