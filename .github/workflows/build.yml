@@ -71,9 +71,10 @@ jobs:
           cat > "dist/$package/INSTALL.txt" <<'EOF'
           macOS 13 or later. Move UU 修补工具.app to Applications and open it.
           Allow Accessibility access, then choose Retry input listener from the menu.
+          Allow Local Network access when using the Windows companion.
           This build uses ad-hoc signing and is not Apple notarized.
           If macOS blocks opening, use System Settings > Privacy & Security > Open Anyway.
-          Configuration: https://github.com/iomect/uu-command-guard#安装与配置
+          Configuration: https://github.com/iomect/uu-command-guard#下载与安装
           EOF
           codesign --verify --strict "dist/$package/UU 修补工具.app"
           ditto -c -k --sequesterRsrc --keepParent "dist/$package" "dist/$package.zip"
@@ -138,7 +139,7 @@ jobs:
           @'
           Windows x64. Unzip and double-click UUCommandBridge.exe.
           Enter the Mac IPv4 address in the settings window.
-          Configuration: https://github.com/iomect/uu-command-guard#安装与配置
+          Configuration: https://github.com/iomect/uu-command-guard#下载与安装
           '@ | Set-Content -Encoding utf8 "$package/INSTALL.txt"
           $archive = "$package.zip"
           Compress-Archive -Path $package -DestinationPath $archive

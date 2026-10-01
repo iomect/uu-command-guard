@@ -2,7 +2,7 @@
 
 用于网易 **UU远程** 的 **Windows 控制 Mac（macOS）** 场景，帮助排查和修复由 Command、Option、Control 标记丢失或残留引起的**快捷键冲突、快捷键失效**，例如 Ctrl+C 无法复制、Ctrl+V 无法粘贴或只输入 v，以及 Ctrl+A、Ctrl+X 等组合键异常。
 
-当前版本 **1.4.0**，Mac 内部版本 `2026-10-01.11`。采用 [MIT 许可证](LICENSE)，与 UU 官方无关联。
+当前版本 **1.4.1**，Mac 内部版本 `2026-10-01.12`。采用 [MIT 许可证](LICENSE)，与 UU 官方无关联。
 
 只修改已有事件的三个修饰标记，键码、文字、事件类型和时间戳保持原样，不补发或重放输入；修饰键事件本身只观察。Mac 另提供离线鼠标按钮/滚轮修补和微信输入法保持。
 
@@ -10,13 +10,13 @@
 
 | 平台 | 下载 |
 | --- | --- |
-| Apple Silicon Mac | [Mac arm64](https://github.com/iomect/uu-command-guard/releases/download/v1.4.0/UUCommandGuard-Mac-arm64.zip) |
-| Intel Mac | [Mac x86_64](https://github.com/iomect/uu-command-guard/releases/download/v1.4.0/UUCommandGuard-Mac-x86_64.zip) |
-| Windows x64 | [Windows x64](https://github.com/iomect/uu-command-guard/releases/download/v1.4.0/UUCommandBridge-Windows-x64.zip) |
+| Apple Silicon Mac | [Mac arm64](https://github.com/iomect/uu-command-guard/releases/download/v1.4.1/UUCommandGuard-Mac-arm64.zip) |
+| Intel Mac | [Mac x86_64](https://github.com/iomect/uu-command-guard/releases/download/v1.4.1/UUCommandGuard-Mac-x86_64.zip) |
+| Windows x64 | [Windows x64](https://github.com/iomect/uu-command-guard/releases/download/v1.4.1/UUCommandBridge-Windows-x64.zip) |
 
 [发布页](https://github.com/iomect/uu-command-guard/releases) 提供 SHA256 校验文件；ZIP 包含程序、许可证及安装说明。**请同时更新两端并先退出旧版。**
 
-1. Mac：支持 macOS 13 以上。把 `UU 修补工具.app` 放入“应用程序”，双击后从菜单打开辅助功能设置并授权，再点击“重试启动监听”。应用采用 ad-hoc 签名，未经 Apple 公证；若被阻止，请在“隐私与安全性”中允许打开。更新签名后可能需要移除旧授权，再重新添加。
+1. Mac：支持 macOS 13 以上。把 `UU 修补工具.app` 放入“应用程序”，双击后从菜单打开辅助功能设置并授权，再点击“重试启动监听”。使用局域网辅助时，还需允许“本地网络”访问。应用采用 ad-hoc 签名，未经 Apple 公证；若被阻止，请在“隐私与安全性”中允许打开。更新签名后可能需要移除旧授权，再重新添加。
 2. Windows：解压并双击 `UUCommandBridge.exe`，填写 Mac IPv4。保存或关闭设置窗口后在托盘运行，再次双击可打开设置；没有运行时依赖。托盘可暂停、设置 IP、导出诊断及退出。
 3. 两端填写对方实际局域网 IPv4。UDP 固定 `47731`，只接收配置 IP/端口；无认证或加密。连接异常时检查 IP、暂停状态、端口占用和 Windows 防火墙，程序不会自动修改防火墙。
 4. Mac 菜单打开“**修饰键映射设置…**”，选择“手动配置”，按 UU 设置填写左 Ctrl、左 Win、左 Alt 的目标并保存。默认是 Ctrl→Command、Win→Control、Alt→Option，目标默认左侧。随后在远程画面正常输入或点击，至少三个唯一配对（包含普通键或按钮）完成输入同步，无需再学习三个左键。右侧源键按需自动验证。
@@ -49,6 +49,10 @@ xattr -cr "/Applications/UU 修补工具.app"
 ## 诊断与设置
 
 默认不写磁盘日志；诊断仅在内存保留最近两分钟，最多512条、1 MiB，退出即丢弃。两端菜单的“导出诊断”允许选择目录和文件名，取消不写文件；导出不含普通键标识、文字、鼠标坐标、剪贴板、窗口标题或完整输入报文。
+
+两端一直等待连接且 Mac 提示“UDP发送失败：网络不可达（errno 65）”时，检查“系统设置 → 隐私与安全性 → 本地网络”。若本工具已允许访问，可将其开关关闭再打开，然后从工具菜单完全退出并重新启动；有多条同名记录时检查每条。错误 65 表示目标不可达，也需检查实际 IP 和网络，不能仅凭该错误认定权限被拒绝。网络诊断包含发送/接收错误码及固定分类计数，不包含地址或报文。
+
+macOS 没有受支持的本地网络权限单项重置方法，多版本或临时签名可能影响身份识别；删除旧应用副本不保证移除旧权限记录，见 [Apple 技术说明](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)。
 
 设置仅在保存时写入：Mac 使用 `local.uu-command-guard` 偏好域，Windows 使用 `%LOCALAPPDATA%\UUCommandBridge\config.json`。映射窗口的“恢复默认”仅修改表单，保存才生效；取消、关闭不会修改配置。诊断区分手动配置、实际验证及冲突状态，不把已配置显示成已验证。
 

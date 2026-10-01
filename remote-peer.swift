@@ -435,8 +435,64 @@ final class PeerPublicationQueue {
         return .ready(batch,overflow:lost)
     }
 }
+enum PeerTransportReason: String, CaseIterable {
+    case send_error, receive_error, rejected_address, rejected_port, rejected_header
+    case rejected_session, rejected_acknowledgement, rejected_duplicate
+}
+struct PeerTransportDiagnostics {
+    private(set) var counters: [String:UInt64] = [:]
+    private(set) var last_send_errno: Int32 = 0
+    private(set) var last_receive_errno: Int32 = 0
+    private(set) var send_error_active = false
+    private(set) var receive_error_active = false
+    private(set) var send_successes: UInt64 = 0
+    private(set) var received_datagrams: UInt64 = 0
+    var error_active: Bool { send_error_active || receive_error_active }
+    mutating func reject(_ reason: PeerTransportReason) { counters[reason.rawValue,default:0] &+= 1 }
+    mutating func sent(result: Int, error: Int32) {
+        if result < 0 { last_send_errno = error; send_error_active = true; reject(.send_error) }
+        else { send_successes &+= 1; send_error_active = false }
+    }
+    // A drained nonblocking socket is healthy; an interrupted call consumes only
+    // its current receive budget and must not invent a transport failure.
+    mutating func received(result: Int, error: Int32) {
+        if result >= 0 { received_datagrams &+= 1; receive_error_active = false }
+        else if error != EAGAIN && error != EWOULDBLOCK && error != EINTR {
+            last_receive_errno = error; receive_error_active = true; reject(.receive_error)
+        }
+    }
+    var status_text: String? {
+        guard error_active else { return nil }
+        let code = send_error_active ? last_send_errno : last_receive_errno
+        let operation = send_error_active ? "发送" : "接收"
+        if code == EACCES || code == EPERM { return "UDP\(operation)被系统拒绝（errno \(code)），检查本地网络权限/防火墙" }
+        if code == EHOSTUNREACH || code == ENETUNREACH { return "UDP\(operation)失败：网络不可达（errno \(code)）" }
+        return "UDP\(operation)失败（errno \(code)），等待重试"
+    }
+    var summary: [String:Any] {
+        ["counters":counters,"last_send_errno":last_send_errno,"last_receive_errno":last_receive_errno,
+         "send_error_active":send_error_active,"receive_error_active":receive_error_active,
+         "send_successes":send_successes,"received_datagrams":received_datagrams]
+    }
+}
+typealias PeerDatagramSender = (Int32, Data, sockaddr_in) -> (result: Int, error: Int32)
+func peer_send_datagram(_ fd: Int32, _ bytes: Data, _ destination: sockaddr_in) -> (result: Int, error: Int32) {
+    var address = destination
+    return bytes.withUnsafeBytes { buffer in
+        withUnsafePointer(to:&address) { pointer in
+            let result = pointer.withMemoryRebound(to:sockaddr.self,capacity:1) { Darwin.sendto(fd,buffer.baseAddress,bytes.count,0,$0,socklen_t(MemoryLayout<sockaddr_in>.size)) }
+            let saved_errno = result < 0 ? errno : 0
+            return (result,saved_errno)
+        }
+    }
+}
 final class RemotePeerBridge {
     private let queue = DispatchQueue(label: "uu.peer.network")
+    private let datagram_sender: PeerDatagramSender
+    private var transport = PeerTransportDiagnostics()
+    private var cached_transport = PeerTransportDiagnostics()
+    private var last_transport_publication: UInt64 = 0
+    private var cache_connected = false
     private let notice: (String)->Void
     private let local_port: UInt16
     private let peer_port: UInt16
@@ -481,12 +537,13 @@ final class RemotePeerBridge {
         _ = drain_publications()
         matcher.configure_mapping(configuration,now:Int64(peer_now_us()))
         binding_requested = ""
-        if main_enabled {
+        if main_enabled && cache_connected && !cached_transport.error_active {
             status_value = matcher.readiness_status_text
             notice(status_value)
         }
     }
-    init(status_notice: @escaping (String)->Void, local_port: UInt16 = 47731, peer_port: UInt16 = 47731) {
+    init(status_notice: @escaping (String)->Void, local_port: UInt16 = 47731, peer_port: UInt16 = 47731, datagram_sender: @escaping PeerDatagramSender = peer_send_datagram) {
+        self.datagram_sender = datagram_sender
         notice = status_notice; self.local_port = local_port; self.peer_port = peer_port
         let source = DispatchSource.makeUserDataOrSource(queue: queue)
         source.setEventHandler { [weak self] in self?.activity() }
@@ -519,7 +576,30 @@ final class RemotePeerBridge {
             return nil
         }
     }
-    private func status(_ text: String) { publish { [weak self] in guard let self = self, self.status_value != text else { return }; self.status_value = text; self.notice(text) } }
+    private func status(_ text: String) { publish { [weak self] in
+        guard let self = self else { return }
+        let shown = self.cached_transport.status_text ?? text
+        guard self.status_value != shown else { return }
+        self.status_value = shown; self.notice(shown)
+    } }
+    private func publish_transport(force: Bool = false) {
+        let now = peer_now_us()
+        guard force || now-last_transport_publication >= 1_000_000 else { return }
+        last_transport_publication = now
+        let snapshot = transport
+        let connected = acknowledged
+        publish { [weak self] in
+            guard let self = self else { return }
+            let prior_error = self.cached_transport.error_active
+            self.cached_transport = snapshot
+            if let text = snapshot.status_text {
+                if self.status_value != text { self.status_value = text; self.notice(text) }
+            } else if prior_error {
+                self.status_value = connected && self.cache_connected ? "已连接，等待 UU 输入" : "等待 Windows 连接"
+                self.notice(self.status_value)
+            }
+        }
+    }
     func configure(peer_ip: String, enabled: Bool) throws {
         var parsed = in_addr()
         guard peer_ip.isEmpty || (peer_ip.split(separator: ".").count == 4 && inet_pton(AF_INET, peer_ip, &parsed) == 1) else {
@@ -528,6 +608,7 @@ final class RemotePeerBridge {
         main_enabled = enabled && !peer_ip.isEmpty
         let token = UUID().uuidString
         main_configuration_token = token
+        cache_connected = false; cached_transport = PeerTransportDiagnostics()
         matcher.clear(now:Int64(peer_now_us())); cache_epoch = ""; binding_requested = ""
         queue.async { [weak self] in
             guard let self = self else { return }
@@ -541,6 +622,8 @@ final class RemotePeerBridge {
         }
     }
     private func open_socket(peer_ip: String, enabled: Bool, parsed: in_addr) {
+        transport = PeerTransportDiagnostics(); last_transport_publication = 0
+        publish_transport(force:true)
         self.peer_ip = peer_ip; self.enabled = enabled
         self.new_epoch(); self.address = sockaddr_in()
         self.address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -574,7 +657,7 @@ final class RemotePeerBridge {
         clock_samples.removeAll(); pending_pings.removeAll(); last_activity = 0; last_peer = 0
         let fresh = epoch
         let boundary_now = Int64(peer_now_us())
-        publish { [weak self] in self?.cache_epoch = fresh; self?.cache_generation = 0; self?.binding_requested = ""; self?.matcher.clear(now:boundary_now) }
+        publish { [weak self] in self?.cache_connected = false; self?.cache_epoch = fresh; self?.cache_generation = 0; self?.binding_requested = ""; self?.matcher.clear(now:boundary_now) }
     }
     private func packet(_ kind: String) -> PeerPacket {
         seq &+= 1
@@ -582,12 +665,12 @@ final class RemotePeerBridge {
     }
     private func send(_ packet: PeerPacket) {
         guard socket_fd >= 0, let bytes = try? JSONEncoder().encode(packet), bytes.count <= 1200 else { return }
-        bytes.withUnsafeBytes { buffer in
-            withUnsafePointer(to:&address) { pointer in
-                _ = pointer.withMemoryRebound(to:sockaddr.self,capacity:1) { Darwin.sendto(socket_fd,buffer.baseAddress,bytes.count,0,$0,socklen_t(MemoryLayout<sockaddr_in>.size)) }
-            }
-        }
+        let previous_error = transport.status_text
+        let outcome = datagram_sender(socket_fd,bytes,address)
+        transport.sent(result:outcome.result,error:outcome.error)
+        publish_transport(force:previous_error != transport.status_text)
     }
+
     private func invalidate_main() {
         let boundary_now = Int64(peer_now_us())
         publish { [weak self] in self?.matcher.window_clear(now:boundary_now) }
@@ -611,18 +694,25 @@ final class RemotePeerBridge {
             var bytes = [UInt8](repeating:0,count:1201); var sender = sockaddr_in()
             var length = socklen_t(MemoryLayout<sockaddr_in>.size)
             let count = withUnsafeMutablePointer(to:&sender) { pointer in pointer.withMemoryRebound(to:sockaddr.self,capacity:1) { Darwin.recvfrom(fd,&bytes,bytes.count,0,$0,&length) } }
-            if count < 0 { break }
+            let saved_errno = count < 0 ? errno : 0
+            let previous_error = transport.status_text
+            transport.received(result:count,error:saved_errno)
+            publish_transport(force:previous_error != transport.status_text)
+            if count < 0 { if saved_errno == EINTR { continue }; break }
             let receipt_now = peer_now_us()
-            guard count <= 1200, sender.sin_addr.s_addr == address.sin_addr.s_addr, sender.sin_port == address.sin_port,
+            guard sender.sin_addr.s_addr == address.sin_addr.s_addr else { transport.reject(.rejected_address); continue }
+            guard sender.sin_port == address.sin_port else { transport.reject(.rejected_port); continue }
+            guard count <= 1200,
                   let p = try? JSONDecoder().decode(PeerPacket.self,from:Data(bytes.prefix(count))), p.v == 1,
                   p.time_us <= UInt64(Int64.max), !p.instance.isEmpty, p.instance.count <= 128,
                   UUID(uuidString:p.instance) != nil,
-                  (UUID(uuidString:p.epoch) != nil || (p.kind == "hello" && p.peer.isEmpty && p.epoch.isEmpty)), (p.window?.count ?? 0) <= 128 else { continue }
+                  (UUID(uuidString:p.epoch) != nil || (p.kind == "hello" && p.peer.isEmpty && p.epoch.isEmpty)), (p.window?.count ?? 0) <= 128 else { transport.reject(.rejected_header); continue }
             receive(p,now:receipt_now)
         }
     }
     private func tick() {
         let now = peer_now_us()
+        publish_transport()
         if now-last_hello >= 1_000_000 {
             last_hello = now; send(packet("hello"))
             if acknowledged {
@@ -657,9 +747,9 @@ final class RemotePeerBridge {
         }
     }
     private func receive(_ p: PeerPacket, now: UInt64) {
-        guard p.peer == instance || (p.kind == "hello" && p.peer.isEmpty) else { return }
+        guard p.peer == instance || (p.kind == "hello" && p.peer.isEmpty) else { transport.reject(.rejected_session); return }
         if p.kind == "hello" && p.peer.isEmpty {
-            guard !retired.contains(p.instance) else { return }
+            guard !retired.contains(p.instance) else { transport.reject(.rejected_session); return }
             if !win_instance.isEmpty && win_instance != p.instance {
                 retired.insert(win_instance); new_epoch(); publish { [weak self] in self?.matcher.clear(keep_consumed:false,now:Int64(now)) }
             }
@@ -668,20 +758,20 @@ final class RemotePeerBridge {
             if let w = p.window { window = w }; scope = p.scope ?? false
             send(packet("hello")); last_peer = now; return
         }
-        guard p.instance == win_instance, p.epoch == epoch else { return }
+        guard p.instance == win_instance, p.epoch == epoch else { transport.reject(.rejected_session); return }
         if p.kind == "hello" {
             let first_ack = !acknowledged
-            guard first_ack || p.seq > received_seq else { return }
+            guard first_ack || p.seq > received_seq else { transport.reject(.rejected_duplicate); return }
             acknowledged = true; last_peer = now; received_seq = max(received_seq,p.seq)
             update_scope(p,now:Int64(now))
-            if first_ack { status("已连接，等待 UU 输入") }; return
+            if first_ack { publish { [weak self] in self?.cache_connected = true }; status("已连接，等待 UU 输入") }; return
         }
-        guard acknowledged else { return }
+        guard acknowledged else { transport.reject(.rejected_acknowledgement); return }
         if p.kind == "events" || p.kind == "snapshot" {
-            guard !received_data.contains(p.seq), p.seq > (received_seq > 512 ? received_seq-512 : 0) else { return }
+            guard !received_data.contains(p.seq), p.seq > (received_seq > 512 ? received_seq-512 : 0) else { transport.reject(.rejected_duplicate); return }
             received_data.insert(p.seq)
             received_data = received_data.filter { $0 > (max(received_seq,p.seq) > 512 ? max(received_seq,p.seq)-512 : 0) }
-        } else { guard p.seq > received_seq else { return } }
+        } else { guard p.seq > received_seq else { transport.reject(.rejected_duplicate); return } }
         received_seq = max(received_seq,p.seq); last_peer = now
         if p.kind == "pong", let echo = p.echo_us, let receipt = p.recv_us, pending_pings.remove(echo) != nil,
            now >= echo, p.time_us >= receipt, now-echo >= p.time_us-receipt {
@@ -783,7 +873,7 @@ final class RemotePeerBridge {
         return decision
     }
     private func update_mapping_status() {
-        if matcher.ready || cache_generation > 0 {
+        if cache_connected && !cached_transport.error_active && (matcher.ready || cache_generation > 0) {
             let text = matcher.readiness_status_text
             if status_value != text { status_value = text; notice(text) }
         }
@@ -827,6 +917,7 @@ final class RemotePeerBridge {
     func reset(reason:String) {
         let token = UUID().uuidString
         main_configuration_token = token
+        cache_connected = false
         matcher.clear(now:Int64(peer_now_us())); cache_epoch = ""; binding_requested = ""
         queue.async { [weak self] in
             guard let self = self else { return }
@@ -862,7 +953,7 @@ final class RemotePeerBridge {
     // Shutdown callers only: input callbacks never invoke this bounded wait.
     func stop() {
         main_configuration_token = UUID().uuidString
-        main_enabled = false; cache_epoch = ""; matcher.clear(now:Int64(peer_now_us()))
+        main_enabled = false; cache_connected = false; cache_epoch = ""; matcher.clear(now:Int64(peer_now_us()))
         let completion = DispatchSemaphore(value: 0)
         queue.async { [weak self] in
             guard let self = self else { completion.signal(); return }
@@ -872,7 +963,7 @@ final class RemotePeerBridge {
         _ = completion.wait(timeout: .now() + .milliseconds(200))
     }
     func diagnostic_summary()->[String:Any] {
-        ["status":status_value,"corrected":matcher.corrected,"skipped":matcher.skipped,
+        ["status":status_value,"connected":cache_connected,"transport":cached_transport.summary,"corrected":matcher.corrected,"skipped":matcher.skipped,
          "window_learned":matcher.ready,"verified_modifier_sides":peer_modifier_sides.filter { matcher.verified_mapping($0.bit) }.count,
          "mapping_mode":matcher.manual_mapping == nil ? "automatic" : "manual",
          "manual_mapping_conflict":matcher.manual_mapping_conflict,

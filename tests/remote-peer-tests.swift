@@ -563,7 +563,111 @@ import Darwin
                   "manual mappings honor local-source protection mask \(protection)")
         }
     }
+    static func transport_diagnostics() throws {
+        var metadata = PeerTransportDiagnostics()
+        metadata.sent(result:-1,error:EACCES)
+        check(metadata.send_error_active && metadata.last_send_errno == EACCES,"send failure preserves immediate errno")
+        check(metadata.status_text?.contains("系统拒绝") == true,"permission errno receives actionable status")
+        metadata.sent(result:-1,error:EHOSTUNREACH)
+        check(metadata.status_text?.contains("网络不可达") == true,"network failure is distinct from permissions")
+        metadata.sent(result:199,error:0)
+        check(!metadata.error_active && metadata.last_send_errno == EHOSTUNREACH && metadata.send_successes == 1,"successful retry clears active error but retains history")
+        metadata.received(result:-1,error:EAGAIN)
+        metadata.received(result:-1,error:EWOULDBLOCK)
+        metadata.received(result:-1,error:EINTR)
+        check(metadata.counters["receive_error"] == nil,"nonblocking drain and interruption do not count as failures")
+        metadata.received(result:-1,error:EACCES)
+        check(metadata.receive_error_active && metadata.last_receive_errno == EACCES,"receive failure records errno")
+        metadata.received(result:199,error:0)
+        check(!metadata.receive_error_active && metadata.received_datagrams == 1,"received datagram restores receive health")
+        for reason in PeerTransportReason.allCases { metadata.reject(reason) }
+        check(Set(metadata.counters.keys) == Set(PeerTransportReason.allCases.map(\.rawValue)),"transport counter keys have a fixed whitelist")
+        check(Set(metadata.summary.keys) == Set(["counters","last_send_errno","last_receive_errno","send_error_active","receive_error_active","send_successes","received_datagrams"]),"transport exports only bounded metadata")
+        let encoded = String(data:try JSONSerialization.data(withJSONObject:metadata.summary),encoding:.utf8)!
+        check(!encoded.contains("127.0.0.1") && !encoded.contains("events") && !encoded.contains("keycode"),"transport metadata does not export addresses or input identifiers")
+
+        final class SenderState {
+            let lock = NSLock()
+            var fail = true
+            var attempts = 0
+            func transmit(_ fd:Int32,_ data:Data,_ address:sockaddr_in)->(result:Int,error:Int32) {
+                lock.lock(); attempts += 1; let blocked = fail; lock.unlock()
+                return blocked ? (-1,EACCES) : peer_send_datagram(fd,data,address)
+            }
+            func recover() { lock.lock(); fail = false; lock.unlock() }
+            var count:Int { lock.lock(); defer { lock.unlock() }; return attempts }
+        }
+        let state = SenderState()
+        let fd = Darwin.socket(AF_INET,SOCK_DGRAM,0)
+        check(fd >= 0,"transport test loopback socket")
+        defer { Darwin.close(fd) }
+        var address = sockaddr_in(); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET); address.sin_port = UInt16(49004).bigEndian
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bound = withUnsafePointer(to:&address) { $0.withMemoryRebound(to:sockaddr.self,capacity:1) { Darwin.bind(fd,$0,socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        check(bound == 0,"transport test loopback port bound")
+        _ = fcntl(fd,F_SETFL,O_NONBLOCK)
+        let remote = RemotePeerBridge(status_notice:{ _ in },local_port:49003,peer_port:49004,datagram_sender:state.transmit)
+        defer { remote.stop(); RunLoop.main.run(until:Date().addingTimeInterval(0.05)) }
+        try remote.configure(peer_ip:"127.0.0.1",enabled:true)
+        RunLoop.main.run(until:Date().addingTimeInterval(0.1))
+        check(remote.status_text.contains("系统拒绝"),"injected hello send error reaches main status")
+        remote.configure_mapping(.default_mapping)
+        check(remote.status_text.contains("系统拒绝"),"manual mapping cannot conceal transport error")
+        let first_attempts = state.count
+        RunLoop.main.run(until:Date().addingTimeInterval(1.1))
+        check(state.count > first_attempts,"failed hello keeps existing retry schedule")
+        state.recover()
+        RunLoop.main.run(until:Date().addingTimeInterval(1.1))
+        check(remote.status_text == "等待 Windows 连接","successful send alone does not claim acknowledgement")
+        remote.configure_mapping(.default_mapping)
+        check(remote.status_text == "等待 Windows 连接","manual configuration preserves waiting handshake state")
+        var destination = address; destination.sin_port = UInt16(49003).bigEndian
+        func send_bytes(_ data:Data) { _ = peer_send_datagram(fd,data,destination) }
+        func send_packet(_ packet:PeerPacket) throws { send_bytes(try JSONEncoder().encode(packet)) }
+        let win = UUID().uuidString
+        try send_packet(PeerPacket(kind:"hello",instance:win,peer:"",epoch:"",generation:0,seq:1,time_us:peer_now_us()))
+        RunLoop.main.run(until:Date().addingTimeInterval(0.1))
+        var hello:PeerPacket?
+        for _ in 0..<32 {
+            var buffer = [UInt8](repeating:0,count:1201)
+            let n = Darwin.recv(fd,&buffer,buffer.count,0)
+            if n < 0 { break }
+            if let p = try? JSONDecoder().decode(PeerPacket.self,from:Data(buffer.prefix(n))), p.kind == "hello", p.peer == win { hello = p }
+        }
+        check(hello != nil,"recovered sender emits targeted hello")
+        guard let hello = hello else { return }
+        try send_packet(PeerPacket(kind:"heartbeat",instance:win,peer:hello.instance,epoch:hello.epoch,generation:0,seq:2,time_us:peer_now_us()))
+        RunLoop.main.run(until:Date().addingTimeInterval(0.05))
+        check(remote.diagnostic_summary()["connected"] as? Bool == false,"non-acknowledgement packet cannot complete handshake")
+        let ack = PeerPacket(kind:"hello",instance:win,peer:hello.instance,epoch:hello.epoch,generation:0,seq:3,time_us:peer_now_us())
+        try send_packet(ack)
+        RunLoop.main.run(until:Date().addingTimeInterval(0.1))
+        check(remote.status_text == "已连接，等待 UU 输入" && remote.diagnostic_summary()["connected"] as? Bool == true,"real hello acknowledgement restores connection")
+        send_bytes(Data("not-json".utf8))
+        try send_packet(PeerPacket(kind:"hello",instance:win,peer:UUID().uuidString,epoch:hello.epoch,generation:0,seq:3,time_us:peer_now_us()))
+        try send_packet(ack)
+        RunLoop.main.run(until:Date().addingTimeInterval(1.1))
+        let snapshot = remote.diagnostic_summary()["transport"] as? [String:Any] ?? [:]
+        let counters = snapshot["counters"] as? [String:UInt64] ?? [:]
+        check(counters["rejected_header"] == 1 && counters["rejected_session"] == 1 && counters["rejected_duplicate"] == 1 && counters["rejected_acknowledgement"] == 1,"receiver reports header session and duplicate rejection without payload")
+        check(counters["send_error",default:0] >= 2 && snapshot["send_error_active"] as? Bool == false,"diagnostic retains failed retries after recovery")
+        try remote.configure(peer_ip:"127.0.0.1",enabled:false)
+        RunLoop.main.run(until:Date().addingTimeInterval(0.1))
+        let reset = remote.diagnostic_summary()["transport"] as? [String:Any] ?? [:]
+        check((reset["counters"] as? [String:UInt64])?.isEmpty == true && remote.diagnostic_summary()["connected"] as? Bool == false,"new configuration resets transport and connected cache")
+        let stale = RemotePeerBridge(status_notice:{ _ in },local_port:49005,peer_port:49006,datagram_sender:{ _,_,_ in (-1,EHOSTUNREACH) })
+        defer { stale.stop(); RunLoop.main.run(until:Date().addingTimeInterval(0.05)) }
+        try stale.configure(peer_ip:"127.0.0.1",enabled:true)
+        // Let the network queue publish an error without draining its main batch.
+        Thread.sleep(forTimeInterval:0.1)
+        try stale.configure(peer_ip:"127.0.0.1",enabled:false)
+        RunLoop.main.run(until:Date().addingTimeInterval(0.1))
+        let stale_summary = stale.diagnostic_summary()["transport"] as? [String:Any] ?? [:]
+        check(stale.status_text == "辅助同步已暂停" && stale_summary["send_error_active"] as? Bool == false,"obsolete configuration error publication cannot revive paused connection")
+    }
     static func main() throws {
+        try transport_diagnostics()
         manual_mappings()
         mapping_time_evidence()
         dynamic_mappings()

@@ -5,7 +5,7 @@ import ApplicationServices
 import Carbon
 import Darwin
 
-let guard_version = "2026-10-01.11"
+let guard_version = "2026-10-01.12"
 let detailed_keyboard_diagnostics = CommandLine.arguments.contains("--diagnostic-session")
 let recovery_interval: UInt64 = 300_000_000
 let log_retention_seconds: TimeInterval = 3600
@@ -1357,6 +1357,21 @@ func self_test() throws {
           "unmatched mouse retains original flags across offline merging during conflict")
     manual_peer.configure_mapping(nil,now:1_045_000)
     check(manual_peer.mappings.isEmpty && !manual_peer.manual_mapping_conflict,"automatic mode revokes manual assumptions")
+    var transport_diagnostic = PeerTransportDiagnostics()
+    transport_diagnostic.sent(result:-1,error:EHOSTUNREACH)
+    check(transport_diagnostic.error_active && transport_diagnostic.last_send_errno == EHOSTUNREACH,
+          "failed UDP send records its immediate errno")
+    check(transport_diagnostic.status_text?.contains("65") == true,
+          "unreachable UDP destination has a visible diagnostic status")
+    transport_diagnostic.received(result:-1,error:EAGAIN)
+    check(!transport_diagnostic.receive_error_active,
+          "normal nonblocking receive does not invent a network error")
+    transport_diagnostic.sent(result:1,error:0)
+    check(!transport_diagnostic.error_active && transport_diagnostic.last_send_errno == EHOSTUNREACH,
+          "successful retry clears active error while retaining diagnostic history")
+    check(Set(transport_diagnostic.summary.keys) == Set(["counters","last_send_errno","last_receive_errno",
+          "send_error_active","receive_error_active","send_successes","received_datagrams"]),
+          "transport diagnostics contain only fixed metadata fields")
     print("PASS: \(checks) state/reconnect/log/input-source checks; no input taps created, input sources selected or events posted")
 }
 
