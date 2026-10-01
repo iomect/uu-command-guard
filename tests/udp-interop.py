@@ -3,6 +3,7 @@
 from pathlib import Path
 import os
 import subprocess
+import time
 import tempfile
 
 project = Path(__file__).resolve().parents[1]
@@ -84,12 +85,27 @@ with tempfile.TemporaryDirectory(prefix="uu-udp-interop-") as folder:
     binary = Path(folder) / "swift-peer"
     source.write_text((project / "remote-peer.swift").read_text() + "\n" + driver)
     subprocess.run(["xcrun", "swiftc", "-warnings-as-errors", str(source), "-o", str(binary)], check=True)
+    go_binary = Path(folder) / "go-peer.test"
+    ready_file = Path(folder) / "go-peer.ready"
+    # Compile before starting the timed Swift fixture; a fresh runner may need
+    # longer than its observation window to populate Go's test build cache.
+    subprocess.run(["go", "test", "-c", "-o", str(go_binary)], cwd=project / "windows", check=True)
     env = os.environ.copy()
-    env.update(UU_BRIDGE_INTEROP_LOCAL_PORT="47732", UU_BRIDGE_INTEROP_PEER_PORT="47733")
-    go_peer = subprocess.Popen(["go", "test", "-run", "^TestUDPInteropPeer$", "-v", "-count=1"],
+    env.update(UU_BRIDGE_INTEROP_LOCAL_PORT="47732", UU_BRIDGE_INTEROP_PEER_PORT="47733",
+               UU_BRIDGE_INTEROP_READY_FILE=str(ready_file))
+    go_peer = subprocess.Popen([str(go_binary), "-test.run=^TestUDPInteropPeer$", "-test.v", "-test.count=1"],
                                cwd=project / "windows", env=env, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True)
     try:
+        ready_deadline = time.monotonic() + 10
+        while not ready_file.exists():
+            if go_peer.poll() is not None:
+                output, _ = go_peer.communicate()
+                print(output)
+                raise RuntimeError("Go UDP integration peer exited before binding its listener")
+            if time.monotonic() >= ready_deadline:
+                raise TimeoutError("Go UDP integration peer did not bind its listener")
+            time.sleep(0.01)
         result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=12)
         print(result.stdout)
         if result.returncode:

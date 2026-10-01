@@ -7,7 +7,7 @@
 - Mac 应用采用 `swiftc -warnings-as-errors` 构建，实际应用包内165项离线自测通过，Info.plist 与 ad-hoc 签名校验通过。
 - Swift 远端模块109项离线及回环 UDP 检查通过，覆盖配对、左右映射、本地来源保护、乱序、重同步、缓存边界、半 RTT 时间容差、未来本地事件拒绝、发布队列预算、快速重配与停止释放端口。
 - Go 与 Swift 实际回环 UDP 联调通过，完成握手、时钟校准、窗口绑定、修饰映射、内存键盘 flags 修正及空闲停止。事件类型、时间戳及键码保持不变；没有向系统发送输入。
-- Windows 可移植核心 race 测试及 x64 交叉编译曾通过。Windows 专用测试可以交叉编译，macOS 无法执行 Windows 托盘、钩子和保存对话框。
+- Windows 可移植核心 race 测试通过；Actions 在 Windows x64 上执行原生 ABI 与离线测试，并核对 GUI EXE 格式、图标和 manifest。独立 UI 预览已在 Windows 上实际打开、截图并正常关闭，未启动输入钩子或网络。
 
 运行命令及要求见 [README.md](README.md)，跨语言规则见 [protocol/PROTOCOL.md](protocol/PROTOCOL.md)。
 

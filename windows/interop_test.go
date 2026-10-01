@@ -30,6 +30,11 @@ func TestUDPInteropPeer(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer conn.Close()
+	if ready_file := os.Getenv("UU_BRIDGE_INTEROP_READY_FILE"); ready_file != "" {
+		if e := os.WriteFile(ready_file, nil, 0600); e != nil {
+			t.Fatal(e)
+		}
+	}
 	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: remote}
 	s := stream_state{Instance: win_uuid, Window: window_uuid, Scope: true, retired: map[string]bool{}}
 	var seq uint64
