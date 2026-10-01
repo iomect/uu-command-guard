@@ -38,8 +38,8 @@ struct PeerObservation {
     var time: Int64; var kind: String; var key: Int; var action: String
     var flags: UInt64; var modifier_class: Int?; var side_bit: UInt64 = 0
 }
-let peer_modifier_sides: [(bit: Int, name: String, group: Int)] = [
-    (1,"左Ctrl",0),(2,"右Ctrl",0),(4,"左Win",2),(8,"右Win",2),(16,"左Alt",1),(32,"右Alt",1)
+let peer_modifier_sides: [(bit: Int, name: String)] = [
+    (1,"左Ctrl"),(2,"右Ctrl"),(4,"左Win"),(8,"右Win"),(16,"左Alt"),(32,"右Alt")
 ]
 let peer_required_modifier_sides = peer_modifier_sides.filter { $0.bit & (1 | 4 | 16) != 0 }
 final class PeerMatcher {
@@ -49,6 +49,9 @@ final class PeerMatcher {
     var delays: [Int64] = []; var ordinary_pair = false
     var mappings: [Int: (Int, UInt64)] = [:]
     var mapping_edges: [Int: (Int, UInt64, UInt8)] = [:]
+    var mapping_evidence: [Int: (UInt64, Int64)] = [:]
+    var mapping_source_watermark: UInt64 = 0
+    var mapping_observation_watermark: Int64 = 0
     var transitions: [(Int64, UInt16)] = []; var continuity = false
     var tentative_window: String?
     var pending_snapshots: [(UInt64, UInt16, UInt64, Int64)] = []
@@ -62,44 +65,60 @@ final class PeerMatcher {
     private(set) var future_tolerance_accepts: UInt64 = 0
     let aggregate: [UInt64] = [CGEventFlags.maskCommand.rawValue,CGEventFlags.maskAlternate.rawValue,CGEventFlags.maskControl.rawValue]
     let devices: [UInt64] = [0x18,0x60,0x2001]
-    let source_sides: [(left: Int, right: Int)] = [(1,2),(16,32),(4,8)]
+    func valid_mapping(_ mapping: (Int, UInt64)?) -> Bool {
+        guard let mapping = mapping, aggregate.indices.contains(mapping.0), mapping.1 != 0 else { return false }
+        return mapping.1 & devices[mapping.0] == mapping.1 && mapping.1 & (mapping.1-1) == 0
+    }
     var unverified_modifier_names: [String] {
-        peer_required_modifier_sides.filter { mappings[$0.bit]?.0 != $0.group }.map(\.name)
+        peer_required_modifier_sides.filter { !valid_mapping(mappings[$0.bit]) }.map(\.name)
     }
     var mapping_status_text: String {
         let pending = unverified_modifier_names
-        return pending.isEmpty ? "辅助同步中，左侧修饰键映射已验证（3/3）" : "辅助同步中，左侧修饰键映射待验证（\(3-pending.count)/3）：\(pending.joined(separator:"、"))"
+        if !pending.isEmpty { return "辅助同步中，左侧修饰键映射待验证（\(3-pending.count)/3）：\(pending.joined(separator:"、"))" }
+        let names = ["Command","Option","Control"]
+        let relationships = peer_required_modifier_sides.map { "\($0.name)→\(names[mappings[$0.bit]!.0])" }
+        return "辅助同步中，左侧修饰键映射已验证（3/3）：\(relationships.joined(separator:"、"))"
     }
     var readiness_status_text: String {
         ready ? mapping_status_text : "辅助同步中，正在重新学习远程窗口（左侧修饰键映射\(3-unverified_modifier_names.count)/3）"
     }
     func modifier_mapping_diagnostic() -> [[String:Any]] {
         peer_modifier_sides.map { side in
+            let confirmed = mappings[side.bit]
             let edges = mapping_edges[side.bit]
-            let compatible_edges = edges?.0 == side.group ? (edges?.2 ?? 0) : 0
-            return ["source_modifier":side.name,"target_modifier":["Command","Option","Control"][side.group],
+            let target = confirmed?.0 ?? edges?.0
+            let target_name = target.flatMap { aggregate.indices.contains($0) ? ["Command","Option","Control"][$0] : nil } ?? "待学习"
+            let matched_edges = edges?.2 ?? 0
+            return ["source_modifier":side.name,"target_modifier":target_name,
                     "required":peer_required_modifier_sides.contains { $0.bit == side.bit },
-                    "verified":mappings[side.bit]?.0 == side.group,
-                    "matched_down":compatible_edges & 1 != 0,"matched_up":compatible_edges & 2 != 0]
+                    "verified":valid_mapping(confirmed),
+                    "matched_down":matched_edges & 1 != 0,"matched_up":matched_edges & 2 != 0]
         }
     }
     func class_mapping_available(_ index: Int, state: UInt16) -> Bool {
-        let sides = source_sides[index]
-        guard mappings[sides.left]?.0 == index else { return false }
-        // 右侧不要求预先学习，但按住未验证的右侧时不能清除或推断整类标记。
-        return state & UInt16(sides.right) == 0 || mappings[sides.right]?.0 == index
+        unverified_modifier_names.isEmpty || mappings.values.contains { valid_mapping($0) && $0.0 == index }
     }
-    func clear(keep_consumed: Bool = true) {
+    private func reset_mapping_evidence(now: Int64, revoke: Bool) {
+        mapping_source_watermark = max(mapping_source_watermark,max(last_consumed_id,max(highest_id,source.map(\.id).max() ?? 0)))
+        mapping_observation_watermark = max(mapping_observation_watermark,max(now,observations.map(\.time).max() ?? 0))
+        mapping_evidence.removeAll(); mapping_edges.removeAll()
+        if revoke { mappings.removeAll() }
+        else { for (bit,mapping) in mappings { mapping_edges[bit] = (mapping.0,mapping.1,3) } }
+    }
+    func clear(keep_consumed: Bool = true, now: Int64 = 0) {
+        reset_mapping_evidence(now:now,revoke:true)
         source.removeAll(); observations.removeAll(); delays.removeAll(); pending_snapshots.removeAll(); hole_since = nil
-        ordinary_pair = false; learned_window = nil; mappings.removeAll(); mapping_edges.removeAll(); transitions.removeAll()
+        ordinary_pair = false; learned_window = nil; transitions.removeAll()
         continuity = false; tentative_window = nil; highest_id = 0; offset = nil; rtt = .infinity; clock_at = 0
-        if !keep_consumed { consumed.removeAll(); last_consumed_id = 0 }
+        if !keep_consumed { consumed.removeAll(); last_consumed_id = 0; mapping_source_watermark = 0 }
     }
-    func window_clear() {
-        stream_clear(); delays.removeAll(); ordinary_pair = false
+    func window_clear(now: Int64 = 0) {
+        reset_mapping_evidence(now:now,revoke:true)
+        stream_clear(now:now); delays.removeAll(); ordinary_pair = false
         tentative_window = nil; learned_window = nil
     }
-    func stream_clear(new_generation: Bool = false) {
+    func stream_clear(new_generation: Bool = false, now: Int64 = 0) {
+        reset_mapping_evidence(now:now,revoke:false)
         source.removeAll(); observations.removeAll(); transitions.removeAll(); continuity = false
         pending_snapshots.removeAll(); hole_since = nil
         if new_generation { highest_id = 0 }
@@ -118,17 +137,17 @@ final class PeerMatcher {
     var ready: Bool { learned_window != nil && delays.count >= 3 }
     func healthy(_ now: Int64) -> Bool { offset != nil && rtt <= 40_000 && now >= clock_at && now-clock_at <= 10_000_000 }
     func delay() -> Int64 { let sorted = delays.sorted(); return sorted.isEmpty ? 0 : sorted[sorted.count/2] }
-    func group(_ key: Int) -> Int? {
-        switch key { case 224,228: return 0; case 226,230: return 1; case 227,231: return 2; default: return nil }
-    }
     func compatible(_ event: PeerInput, _ observation: PeerObservation) -> Bool {
         guard event.kind == observation.kind && event.action == observation.action else { return false }
-        if observation.kind == "modifier" { return group(event.key) == observation.modifier_class }
+        if observation.kind == "modifier" {
+            return bit(event.key) != 0 && observation.modifier_class.map { aggregate.indices.contains($0) } == true
+        }
         return event.key == observation.key
     }
     func candidates(_ observation: PeerObservation, now: Int64) -> [PeerInput] {
         source.filter { event in
             guard event.id > last_consumed_id, consumed[event.id] == nil, compatible(event, observation), learned_window == nil || event.window == learned_window else { return false }
+            if observation.kind == "modifier" && event.id <= mapping_source_watermark { return false }
             let difference = observation.time - mapped(event.time_us)
             if ready { return abs(Double(difference) - Double(delay())) <= 25_000 + rtt/2 }
             return difference >= -50_000 && difference <= 250_000
@@ -138,13 +157,24 @@ final class PeerMatcher {
         guard healthy(now) else { last_pair_reason = "clock_unhealthy"; return nil }
         guard hole_since == nil else { last_pair_reason = "sequence_hole"; return nil }
         guard observation.kind != "motion" else { last_pair_reason = "motion_not_paired"; return nil }
+        guard observation.kind != "modifier" || observation.time > mapping_observation_watermark else { last_pair_reason = "stale_mapping_observation"; return nil }
         let matches = candidates(observation, now: now)
         guard !matches.isEmpty else { last_pair_reason = "no_candidate"; return nil }
         guard matches.count == 1, let event = matches.first else { last_pair_reason = "ambiguous_candidates"; return nil }
-        let d = observation.time - mapped(event.time_us)
+        let source_time = mapped(event.time_us)
+        if observation.kind == "modifier" {
+            // Mapping evidence must pass the same source-age and clock uncertainty
+            // bounds as a correction, before it can consume or revoke any evidence.
+            let observed_now = min(now,observation.time)
+            guard source_time <= observed_now || source_time-observed_now <= Int64(rtt/2) else { last_pair_reason = "source_from_future"; return nil }
+            guard now-source_time <= 500_000 else { last_pair_reason = "source_stale"; return nil }
+        }
+        let d = observation.time - source_time
         if !ready, !delays.isEmpty, abs(Double(d) - Double(delay())) > 20_000 { last_pair_reason = "inconsistent_learning_delay"; return nil }
         // Calibration cannot combine windows: restart tentative samples on candidate change.
-        if learned_window == nil, let first = tentative_window, first != event.window { delays.removeAll(); ordinary_pair = false }
+        if learned_window == nil, let first = tentative_window, first != event.window {
+            reset_mapping_evidence(now:now,revoke:true); delays.removeAll(); ordinary_pair = false
+        }
         tentative_window = event.window
         consumed[event.id] = now; last_consumed_id = event.id
         if consumed.count > 512, let oldest = consumed.min(by: { $0.value < $1.value })?.key { consumed.removeValue(forKey: oldest) }
@@ -152,27 +182,41 @@ final class PeerMatcher {
         if delays.count > 8 { delays.removeFirst() }
         ordinary_pair = ordinary_pair || observation.kind == "key" || observation.kind == "button"
         if learned_window == nil && delays.count >= 3 && ordinary_pair { learned_window = event.window }
-        if let index = observation.modifier_class, let source_group = group(event.key), source_group == index {
-            let source_bit = bit(event.key)
-            let down = event.action == "down"
-            let aggregate_down = observation.flags & aggregate[index] != 0
-            // Device mapping is proven by the physical modifier's own matched edge.
-            if source_bit != 0 && aggregate_down == down && observation.side_bit != 0 {
-                let side_down = observation.flags & observation.side_bit != 0
-                if side_down == down {
-                    let prior = mapping_edges[Int(source_bit)]
-                    let edge: UInt8 = down ? 1 : 2
-                    let combined = prior?.0 == index && prior?.1 == observation.side_bit ? (prior!.2 | edge) : edge
-                    if let verified = mappings[Int(source_bit)], verified.0 != index || verified.1 != observation.side_bit {
-                        mappings.removeValue(forKey: Int(source_bit))
-                    }
-                    mapping_edges[Int(source_bit)] = (index, observation.side_bit, combined)
-                    if combined == 3 { mappings[Int(source_bit)] = (index, observation.side_bit) }
-                }
-            }
-        }
+        learn_mapping(event,observation:observation)
         last_pair_reason = "matched"
         return event
+    }
+    private func learn_mapping(_ event: PeerInput, observation: PeerObservation) {
+        guard event.kind == "modifier", let index = observation.modifier_class, aggregate.indices.contains(index),
+              event.id > mapping_source_watermark, observation.time > mapping_observation_watermark else { return }
+        let source_bit = bit(event.key)
+        let side = observation.side_bit
+        let down = event.action == "down"
+        guard source_bit != 0, (event.mods & source_bit != 0) == down,
+              valid_mapping((index,side)), (observation.flags & side != 0) == down,
+              observation.flags & devices[index] == (down ? side : 0),
+              (observation.flags & aggregate[index] != 0) == down else { return }
+        let key = Int(source_bit)
+        if let evidence = mapping_evidence[key], event.id <= evidence.0 || observation.time <= evidence.1 { return }
+        let prior = mapping_edges[key]
+        let known = mappings[key].map { ($0.0,$0.1) } ?? prior.map { ($0.0,$0.1) }
+        if let known = known, known.0 != index || known.1 != side {
+            // A reliable conflicting edge changes the whole configuration. Its opposite
+            // edge must come from newer source and Mac observations, never old history.
+            mappings.removeAll(); mapping_edges.removeAll(); mapping_evidence.removeAll()
+            mapping_source_watermark = max(mapping_source_watermark,event.id)
+            mapping_observation_watermark = max(mapping_observation_watermark,observation.time)
+        }
+        let edge: UInt8 = down ? 1 : 2
+        let current = mapping_edges[key]
+        let combined: UInt8
+        if down { combined = 1 }
+        else if current?.0 == index && current?.1 == side && current?.2 == 1 { combined = 3 }
+        else if valid_mapping(mappings[key]) { combined = 3 }
+        else { combined = edge }
+        mapping_edges[key] = (index,side,combined)
+        mapping_evidence[key] = (event.id,observation.time)
+        if combined == 3 { mappings[key] = (index,side) }
     }
     func bit(_ key: Int) -> UInt16 {
         switch key { case 224:return 1;case 228:return 2;case 227:return 4;case 231:return 8;case 226:return 16;case 230:return 32;default:return 0 }
@@ -182,7 +226,7 @@ final class PeerMatcher {
         guard (hole_since.map { now >= $0 && now-$0 >= 100_000 } ?? false) || !timed.isEmpty else { return }
         let watermark = max(highest_id, max(source.map(\.id).max() ?? 0, timed.map { $0.2 }.max() ?? 0))
         let last = timed.last
-        window_clear(); highest_id = watermark; last_consumed_id = max(last_consumed_id,watermark)
+        window_clear(now:now); highest_id = watermark; last_consumed_id = max(last_consumed_id,watermark)
         if let state = last { apply_snapshot(time:state.0,mods:state.1) }
     }
     private func apply_snapshot(time: UInt64, mods: UInt16) {
@@ -194,7 +238,7 @@ final class PeerMatcher {
     }
     func ingest(_ events: [PeerInput], gap: Bool, now: Int64) {
         prune(now)
-        if gap { window_clear() }
+        if gap { window_clear(now:now) }
         let ordered = events.filter(\.valid).sorted { $0.id < $1.id }
         if highest_id == 0, let first = ordered.first { highest_id = max(last_consumed_id, first.id-1) }
         for event in ordered where consumed[event.id] == nil && !source.contains(where: { $0.id == event.id }) {
@@ -215,7 +259,7 @@ final class PeerMatcher {
         else { hole_since = nil }
         if source.count > 512 {
             let watermark = source.map(\.id).max() ?? highest_id
-            window_clear(); highest_id = watermark; last_consumed_id = max(last_consumed_id,watermark)
+            window_clear(now:now); highest_id = watermark; last_consumed_id = max(last_consumed_id,watermark)
         }
         let available = pending_snapshots.filter { $0.2 <= highest_id }
         pending_snapshots.removeAll { $0.2 <= highest_id }
@@ -232,7 +276,7 @@ final class PeerMatcher {
         guard healthy(now), mods < 256, time <= UInt64(Int64.max) else { return }
         if event_seq > highest_id {
             pending_snapshots.append((time,mods,event_seq,now))
-            if pending_snapshots.count > 16 { window_clear() }
+            if pending_snapshots.count > 16 { window_clear(now:now) }
             return
         }
         if hole_since == nil { apply_snapshot(time:time,mods:mods) }
@@ -270,27 +314,31 @@ final class PeerMatcher {
         }
         if observation.kind == "modifier" { last_decision_reason = "modifier_observation"; skipped &+= 1; return nil }
         guard let state = mods else { skipped &+= 1; return nil }
-        var flags = observation.flags; var mask: UInt8 = 0; var preserve_mask: UInt8 = 0
-        let groups: [UInt16] = [3,48,12]
-        for index in 0..<3 where protected & (1 << index) == 0 {
-            let bits: [UInt16] = (0..<8).map { UInt16(1 << $0) }.filter { groups[index] & $0 != 0 }
-            if state & UInt16(source_sides[index].right) != 0 && mappings[source_sides[index].right]?.0 != index {
-                preserve_mask |= 1 << index
+        let active_unknown = peer_modifier_sides.filter { state & UInt16($0.bit) != 0 && !valid_mapping(mappings[$0.bit]) }
+        if !active_unknown.isEmpty {
+            last_decision_reason = active_unknown.contains { $0.bit & (2|8|32) != 0 } ? "unverified_active_right_modifier" : "unverified_active_modifier"
+            skipped &+= 1
+            return RemoteFlagDecision(flags:observation.flags,class_mask:0,preserve_mask:7)
+        }
+        var flags = observation.flags; var mask: UInt8 = 0; var preserve_mask: UInt8 = protected & 7
+        for index in 0..<3 {
+            let class_bit = UInt8(1 << index)
+            guard protected & class_bit == 0, class_mapping_available(index,state:state) else {
+                preserve_mask |= class_bit
                 continue
             }
-            guard class_mapping_available(index,state:state) else { continue }
-            mask |= 1 << index; flags &= ~(aggregate[index] | devices[index])
-            if state & groups[index] != 0 { flags |= aggregate[index] }
-            for bit in bits where state & bit != 0 { flags |= mappings[Int(bit)]!.1 }
+            mask |= class_bit; flags &= ~(aggregate[index] | devices[index])
+            let active = peer_modifier_sides.compactMap { side -> (Int, UInt64)? in
+                guard state & UInt16(side.bit) != 0, let mapping = mappings[side.bit], mapping.0 == index else { return nil }
+                return mapping
+            }
+            if !active.isEmpty { flags |= aggregate[index] }
+            for mapping in active { flags |= mapping.1 }
         }
         guard mask != 0 else {
-            if preserve_mask != 0 {
-                last_decision_reason = "unverified_active_right_modifier"; skipped &+= 1
-                return RemoteFlagDecision(flags:flags,class_mask:0,preserve_mask:preserve_mask)
-            }
-            let any_verified = (0..<3).contains { class_mapping_available($0,state:state) }
-            last_decision_reason = any_verified ? "local_modifier_protected" : "mapping_unverified"
-            skipped &+= 1; return nil
+            last_decision_reason = mappings.values.contains { valid_mapping($0) } ? "local_modifier_protected" : "mapping_unverified"
+            skipped &+= 1
+            return RemoteFlagDecision(flags:observation.flags,class_mask:0,preserve_mask:preserve_mask)
         }
         last_decision_reason = flags == observation.flags ? "matched_flags_unchanged" : "flags_corrected"
         if flags != observation.flags { corrected &+= 1 }
@@ -419,7 +467,7 @@ final class RemotePeerBridge {
         main_enabled = enabled && !peer_ip.isEmpty
         let token = UUID().uuidString
         main_configuration_token = token
-        matcher.clear(); cache_epoch = ""; binding_requested = ""
+        matcher.clear(now:Int64(peer_now_us())); cache_epoch = ""; binding_requested = ""
         queue.async { [weak self] in
             guard let self = self else { return }
             self.network_configuration_token = token
@@ -464,7 +512,8 @@ final class RemotePeerBridge {
         active = false; acknowledged = false; scope = false; window = ""; bound_window = ""
         clock_samples.removeAll(); pending_pings.removeAll(); last_activity = 0; last_peer = 0
         let fresh = epoch
-        publish { [weak self] in self?.cache_epoch = fresh; self?.cache_generation = 0; self?.binding_requested = ""; self?.matcher.clear() }
+        let boundary_now = Int64(peer_now_us())
+        publish { [weak self] in self?.cache_epoch = fresh; self?.cache_generation = 0; self?.binding_requested = ""; self?.matcher.clear(now:boundary_now) }
     }
     private func packet(_ kind: String) -> PeerPacket {
         seq &+= 1
@@ -478,11 +527,21 @@ final class RemotePeerBridge {
             }
         }
     }
-    private func invalidate_main() { publish { [weak self] in self?.matcher.stream_clear() } }
-    private func cease() {
+    private func invalidate_main() {
+        let boundary_now = Int64(peer_now_us())
+        publish { [weak self] in self?.matcher.window_clear(now:boundary_now) }
+    }
+    private func cease(boundary: Bool = false, now: Int64 = 0) {
         active = false; generation &+= 1; send(packet("stop"))
         let revoked = generation
-        publish { [weak self] in self?.cache_generation = revoked; self?.matcher.stream_clear() }
+        let boundary_now = now == 0 ? Int64(peer_now_us()) : now
+        if boundary { bound_window = "" }
+        publish { [weak self] in
+            guard let self = self else { return }
+            self.cache_generation = revoked
+            if boundary { self.matcher.window_clear(now:boundary_now); self.binding_requested = "" }
+            else { self.matcher.stream_clear(now:boundary_now) }
+        }
         status("已连接，等待 UU 输入")
     }
     private func receive_pending(fd: Int32) {
@@ -514,21 +573,34 @@ final class RemotePeerBridge {
         if last_peer != 0 && now-last_peer > 3_000_000 {
             new_epoch(); invalidate_main(); status("Windows 连接已失效")
         }
-        if active && now-last_activity >= 2_000_000 { cease() }
+        if active && now-last_activity >= 2_000_000 { cease(now:Int64(now)) }
         if active && now-last_start >= 100_000 {
             last_start = now; var p = packet("start"); p.window = window; send(p)
         }
     }
-    private func update_scope(_ p: PeerPacket) {
-        scope = p.scope ?? scope; window = p.window ?? window
-        if active && (!scope || (!bound_window.isEmpty && window != bound_window)) { cease() }
+    private func update_scope(_ p: PeerPacket, now: Int64) {
+        let next_scope = p.scope ?? scope
+        let next_window = p.window ?? window
+        let known_boundary = (!window.isEmpty || scope) && (next_scope != scope || next_window != window)
+        scope = next_scope; window = next_window
+        if known_boundary || (active && (!scope || (!bound_window.isEmpty && window != bound_window))) {
+            bound_window = ""
+            if active { cease(boundary:true,now:now) }
+            else {
+                publish { [weak self] in
+                    guard let self = self else { return }
+                    self.matcher.window_clear(now:now); self.binding_requested = ""
+                    self.update_mapping_status()
+                }
+            }
+        }
     }
     private func receive(_ p: PeerPacket, now: UInt64) {
         guard p.peer == instance || (p.kind == "hello" && p.peer.isEmpty) else { return }
         if p.kind == "hello" && p.peer.isEmpty {
             guard !retired.contains(p.instance) else { return }
             if !win_instance.isEmpty && win_instance != p.instance {
-                retired.insert(win_instance); new_epoch(); publish { [weak self] in self?.matcher.clear(keep_consumed: false) }
+                retired.insert(win_instance); new_epoch(); publish { [weak self] in self?.matcher.clear(keep_consumed:false,now:Int64(now)) }
             }
             win_instance = p.instance
             if acknowledged { last_peer = now; return }
@@ -540,7 +612,7 @@ final class RemotePeerBridge {
             let first_ack = !acknowledged
             guard first_ack || p.seq > received_seq else { return }
             acknowledged = true; last_peer = now; received_seq = max(received_seq,p.seq)
-            update_scope(p)
+            update_scope(p,now:Int64(now))
             if first_ack { status("已连接，等待 UU 输入") }; return
         }
         guard acknowledged else { return }
@@ -562,17 +634,17 @@ final class RemotePeerBridge {
             let best_rtt = best.1; let best_offset = best.2
             publish { [weak self] in
                 guard let self = self, self.cache_epoch == packet_epoch else { return }
-                if let prior = self.matcher.offset, abs(prior-best_offset) > 50_000 { self.matcher.clear() }
+                if let prior = self.matcher.offset, abs(prior-best_offset) > 50_000 { self.matcher.clear(now:Int64(now)) }
                 self.matcher.rtt = best_rtt; self.matcher.offset = best_offset
                 self.matcher.clock_at = Int64(now)
             }; return
         }
         if p.kind == "prepare" || p.kind == "heartbeat" {
-            update_scope(p)
+            update_scope(p,now:Int64(now))
             return
         }
+        if p.kind == "stop", p.generation == generation { cease(boundary:true,now:Int64(now)); return }
         guard active, p.generation == generation else { return }
-        if p.kind == "stop" { cease(); return }
         if p.kind == "events" {
             guard let events = p.events, events.count <= 512,
                   events.allSatisfy({ $0.valid && $0.window == window && $0.time_us <= p.time_us }) else { return }
@@ -604,12 +676,13 @@ final class RemotePeerBridge {
         if !active && scope && !window.isEmpty {
             active = true; generation &+= 1; last_start = 0
             let fresh_generation = generation
+            let boundary_now = Int64(peer_now_us())
             let changing_window = !bound_window.isEmpty && bound_window != window
             if changing_window { bound_window = "" }
             publish { [weak self] in
                 self?.cache_generation = fresh_generation
-                self?.matcher.stream_clear(new_generation:true)
-                if changing_window { self?.matcher.window_clear(); self?.binding_requested = "" }
+                self?.matcher.stream_clear(new_generation:true,now:boundary_now)
+                if changing_window { self?.matcher.window_clear(now:boundary_now); self?.binding_requested = "" }
             }
             status("正在学习远程窗口")
         }
@@ -682,7 +755,7 @@ final class RemotePeerBridge {
     func reset(reason:String) {
         let token = UUID().uuidString
         main_configuration_token = token
-        matcher.clear(); cache_epoch = ""; binding_requested = ""
+        matcher.clear(now:Int64(peer_now_us())); cache_epoch = ""; binding_requested = ""
         queue.async { [weak self] in
             guard let self = self else { return }
             self.network_configuration_token = token
@@ -717,7 +790,7 @@ final class RemotePeerBridge {
     // Shutdown callers only: input callbacks never invoke this bounded wait.
     func stop() {
         main_configuration_token = UUID().uuidString
-        main_enabled = false; cache_epoch = ""; matcher.clear()
+        main_enabled = false; cache_epoch = ""; matcher.clear(now:Int64(peer_now_us()))
         let completion = DispatchSemaphore(value: 0)
         queue.async { [weak self] in
             guard let self = self else { completion.signal(); return }

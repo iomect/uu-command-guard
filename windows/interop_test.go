@@ -64,7 +64,27 @@ func TestUDPInteropPeer(t *testing.T) {
 	var mods uint16
 	hello, ping, start, stop, bound := false, false, false, false, false
 	var received uint64
+	scope_reset, scope_restored, resume_started := false, false, false
+	file_exists := func(name string) bool {
+		if name == "" {
+			return false
+		}
+		_, e := os.Stat(name)
+		return e == nil
+	}
 	for time.Now().Before(deadline) {
+		if !scope_reset && file_exists(os.Getenv("UU_BRIDGE_INTEROP_SCOPE_RESET_FILE")) {
+			scope = false
+			send(packet{Kind: "heartbeat", Window: s.Window, Scope: &scope})
+			scope_reset = true
+		}
+		if scope_reset && !scope_restored && file_exists(os.Getenv("UU_BRIDGE_INTEROP_SCOPE_RESUME_FILE")) {
+			scope = true
+			send(packet{Kind: "heartbeat", Window: s.Window, Scope: &scope})
+			send(packet{Kind: "prepare", Window: s.Window, Scope: &scope})
+			scope_restored = true
+			stop = false
+		}
 		if time.Now().After(nextHello) {
 			kind := "heartbeat"
 			if s.Peer == "" {
@@ -124,13 +144,17 @@ func TestUDPInteropPeer(t *testing.T) {
 			s.Generation = gen
 		case "start":
 			start = true
+			if scope_restored && !resume_started {
+				resume_started = true
+				stop = false
+			}
 		case "bind":
 			bound = true
 		case "stop":
 			stop = true
 		}
-		if hello && ping && start && stop {
-			t.Logf("real UDP verified: handshake, ping/pong, start, fixture events=%d, bind=%v, stop; received=%d", ids, bound, received)
+		if hello && ping && start && stop && (!scope_reset || (scope_restored && resume_started)) {
+			t.Logf("real UDP verified: handshake, ping/pong, start, fixture events=%d, bind=%v, scope-restored=%v, stop; received=%d", ids, bound, scope_restored, received)
 			return
 		}
 	}

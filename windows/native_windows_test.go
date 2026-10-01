@@ -14,6 +14,22 @@ func TestNativeABI(t *testing.T) {
 	}
 }
 
+func TestMouseMotionDoesNotPublish(t *testing.T) {
+	previous := native
+	a := &native_app{input: make(chan source_event, 512), diag: &diagnostics{}}
+	a.event_id.Store(17)
+	a.mods.Store(1)
+	native = a
+	defer func() { native = previous }()
+	for i := 0; i < 1000; i++ {
+		// A nil payload must be safe: motion is ignored before decoding or scope work.
+		mouse_proc(0, 0x200, 0)
+	}
+	if a.event_id.Load() != 17 || a.mods.Load() != 1 || len(a.input) != 0 || a.overflow.Load() || a.gap_reasons.Load() != 0 {
+		t.Fatal("mouse motion changed input state or published evidence")
+	}
+}
+
 func TestSourceGapReasonsAccumulateAndConsume(t *testing.T) {
 	a := &native_app{diag: &diagnostics{}}
 	a.mark_source_gap(gap_modifier_state_mismatch)

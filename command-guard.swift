@@ -5,7 +5,8 @@ import ApplicationServices
 import Carbon
 import Darwin
 
-let guard_version = "2026-10-01.9"
+let guard_version = "2026-10-01.10"
+let detailed_keyboard_diagnostics = CommandLine.arguments.contains("--diagnostic-session")
 let recovery_interval: UInt64 = 300_000_000
 let log_retention_seconds: TimeInterval = 3600
 
@@ -24,10 +25,10 @@ let modifier_specs: [ModifierSpec] = [
     ModifierSpec(name: "Ctrl", left_key: 59, right_key: 62, aggregate: CGEventFlags.maskControl.rawValue, device_bits: 0x01 | 0x2000)
 ]
 let watched_bits = modifier_specs.reduce(UInt64(0)) { $0 | $1.all_bits }
-let mouse_types: Set<CGEventType> = [.mouseMoved, .leftMouseDown, .leftMouseUp,
-    .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp,
-    .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .scrollWheel]
+let mouse_types: Set<CGEventType> = [.leftMouseDown, .leftMouseUp,
+    .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp, .scrollWheel]
 let keyboard_types: Set<CGEventType> = [.keyDown, .keyUp]
+let monitored_event_types = mouse_types.union(keyboard_types).union([.flagsChanged])
 
 struct SourceState {
     var down: Bool? = nil
@@ -819,6 +820,8 @@ func self_test() throws {
         precondition(value, message)
         checks += 1
     }
+    check(monitored_event_types.isDisjoint(with: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]), "motion and drag excluded from event tap")
+    check(keyboard_types.union([.flagsChanged, .leftMouseDown, .scrollWheel]).isSubset(of: monitored_event_types), "shortcut and modifier repairs remain monitored")
     func ready_state() -> GuardState {
         var state = GuardState()
         _ = state.reconcile(snapshot: SystemSnapshot(), now: 0)
@@ -1093,8 +1096,8 @@ func self_test() throws {
     peer_learning.mappings = [1:(0,8),2:(0,16),4:(2,1),8:(2,8192),16:(1,32),32:(1,64)]
     check(peer_learning.ready && peer_learning.readiness_status_text.contains("映射已验证"), "learned peer with complete mapping is ready")
     peer_learning.ingest([], gap: true, now: 100)
-    check(!peer_learning.ready && peer_learning.mappings.count == 6 && peer_learning.readiness_status_text.contains("重新学习"),
-          "peer source gap preserves mapping but visibly revokes readiness")
+    check(!peer_learning.ready && peer_learning.mappings.isEmpty && peer_learning.readiness_status_text.contains("重新学习"),
+          "peer source gap revokes mapping evidence and readiness")
     let missing_peer_input = PeerObservation(time:100,kind:"key",key:25,action:"down",flags:0,modifier_class:nil)
     check(peer_learning.decide(missing_peer_input,now:100,protected:0) == nil && peer_learning.last_decision_reason == "no_candidate",
           "missing source evidence never guesses a keyboard modifier")
@@ -1114,8 +1117,45 @@ func self_test() throws {
     var released_guard = GuardState()
     released_guard.modifiers[0].needs_sync = false; released_guard.modifiers[0].uu.down = false
     let offline_mouse = released_guard.corrected_flags(is_uu:true,flags:unknown_right_flags)
-    check(offline_mouse == 0 && protected_mouse?.preserve_mask == 1 && merge_remote_mouse_flags(offline_flags:offline_mouse,correction:protected_mouse) == unknown_right_flags,
-          "credible unverified right modifier is preserved across legacy mouse clearing")
+    check(offline_mouse == 0 && protected_mouse?.preserve_mask == 7 && merge_remote_mouse_flags(offline_flags:offline_mouse,correction:protected_mouse) == unknown_right_flags,
+          "an unknown right mapping protects every possible target across legacy mouse clearing")
+    let dynamic_peer = PeerMatcher()
+    dynamic_peer.offset = 0; dynamic_peer.rtt = 1000; dynamic_peer.clock_at = 1_000_000
+    dynamic_peer.learned_window = "self-test-window"; dynamic_peer.delays = [5000,5000,5000]; dynamic_peer.ordinary_pair = true
+    let control_flags = modifier_specs[2].aggregate|1
+    let dynamic_down = PeerObservation(time:1_015_000,kind:"modifier",key:0,action:"down",flags:control_flags,modifier_class:2,side_bit:1)
+    dynamic_peer.ingest([PeerInput(id:1,time_us:1_010_000,window:"self-test-window",kind:"modifier",key:224,action:"down",mods:1)],gap:false,now:1_011_000)
+    _ = dynamic_peer.decide(dynamic_down,now:1_015_000,protected:0)
+    check(dynamic_peer.mappings.isEmpty, "a remapped Ctrl down alone never proves its target")
+    let dynamic_up = PeerObservation(time:1_025_000,kind:"modifier",key:0,action:"up",flags:0,modifier_class:2,side_bit:1)
+    dynamic_peer.ingest([PeerInput(id:2,time_us:1_020_000,window:"self-test-window",kind:"modifier",key:224,action:"up",mods:0)],gap:false,now:1_021_000)
+    _ = dynamic_peer.decide(dynamic_up,now:1_025_000,protected:0)
+    check(dynamic_peer.mappings[1]?.0 == 2 && dynamic_peer.mappings[1]?.1 == 1, "complete physical edges learn Ctrl to Control")
+    dynamic_peer.ingest([PeerInput(id:3,time_us:1_030_000,window:"self-test-window",kind:"key",key:25,action:"down",mods:1)],gap:false,now:1_031_000)
+    let dynamic_key = PeerObservation(time:1_035_000,kind:"key",key:25,action:"down",flags:0,modifier_class:nil)
+    let dynamic_correction = dynamic_peer.decide(dynamic_key,now:1_035_000,protected:0)
+    check(dynamic_correction?.flags == control_flags && dynamic_correction?.class_mask == 4 && dynamic_correction?.preserve_mask == 3,
+          "partial dynamic learning repairs its proven target and preserves unknown targets")
+    dynamic_peer.ingest([PeerInput(id:4,time_us:1_040_000,window:"self-test-window",kind:"button",key:1,action:"down",mods:4)],gap:false,now:1_041_000)
+    let dynamic_mouse = PeerObservation(time:1_045_000,kind:"button",key:1,action:"down",flags:unknown_right_flags,modifier_class:nil)
+    let unknown_left = dynamic_peer.decide(dynamic_mouse,now:1_045_000,protected:0)
+    check(unknown_left?.class_mask == 0 && unknown_left?.preserve_mask == 7 && merge_remote_mouse_flags(offline_flags:0,correction:unknown_left) == unknown_right_flags,
+          "an active unknown left mapping cannot lose flags through the legacy mouse path")
+    dynamic_peer.mappings = [1:(1,32),4:(1,64),16:(2,1)]
+    dynamic_peer.ingest([PeerInput(id:5,time_us:1_050_000,window:"self-test-window",kind:"key",key:25,action:"down",mods:1|4)],gap:false,now:1_051_000)
+    let merged_targets = PeerObservation(time:1_055_000,kind:"key",key:25,action:"down",flags:modifier_specs[0].aggregate|8|CGEventFlags.maskShift.rawValue,modifier_class:nil)
+    let merged_result = dynamic_peer.decide(merged_targets,now:1_055_000,protected:0)
+    check(merged_result?.flags == modifier_specs[1].aggregate|32|64|CGEventFlags.maskShift.rawValue && merged_result?.class_mask == 7,
+          "multiple source modifiers combine target sides, clear unused targets and preserve Shift")
+    dynamic_peer.ingest([PeerInput(id:6,time_us:1_060_000,window:"self-test-window",kind:"key",key:25,action:"down",mods:4)],gap:false,now:1_061_000)
+    var one_target_held = merged_targets; one_target_held.time = 1_065_000
+    check(dynamic_peer.decide(one_target_held,now:1_065_000,protected:0)?.flags == modifier_specs[1].aggregate|64|CGEventFlags.maskShift.rawValue,
+          "releasing one source keeps the other source on the shared target")
+    dynamic_peer.ingest([PeerInput(id:7,time_us:1_070_000,window:"self-test-window",kind:"modifier",key:224,action:"down",mods:1)],gap:false,now:1_071_000)
+    let changed_target = PeerObservation(time:1_075_000,kind:"modifier",key:0,action:"down",flags:modifier_specs[0].aggregate|8,modifier_class:0,side_bit:8)
+    _ = dynamic_peer.decide(changed_target,now:1_075_000,protected:0)
+    check(dynamic_peer.mappings.isEmpty && dynamic_peer.unverified_modifier_names.count == 3,
+          "a reliable changed target revokes the entire previous configuration")
     let future_peer = PeerMatcher()
     future_peer.offset = 0; future_peer.rtt = 1000; future_peer.clock_at = 1_000_000
     future_peer.learned_window = "self-test-window"; future_peer.delays = [0,0,0]; future_peer.mappings = [1:(0,8)]
@@ -1222,13 +1262,7 @@ var session_run_source: CFRunLoopSource?
 var hid_keyboard_count: UInt64 = 0
 var session_keyboard_count: UInt64 = 0
 var corrected_count: UInt64 = 0
-var uu_mouse_count: UInt64 = 0
-var foreign_mouse_count: UInt64 = 0
-var sampled_mouse_count: UInt64 = 0
-var last_motion_signature = ""
-var last_motion_log: UInt64 = 0
 var last_snapshot = SystemSnapshot()
-var snapshot_time: UInt64 = 0
 var sleeping = false
 let process_queue = DispatchQueue(label: "uu-command-guard.process")
 var process_check_pending = false
@@ -1281,8 +1315,17 @@ func callback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent,
         if let tap = event_tap { CGEvent.tapEnable(tap: tap, enable: true) }
         return Unmanaged.passUnretained(event)
     }
+    guard monitored_event_types.contains(type) else { return Unmanaged.passUnretained(event) }
+    let modifier_key = type == .flagsChanged ? event.getIntegerValueField(.keyboardEventKeycode) : nil
+    if let key = modifier_key, !modifier_specs.contains(where: { key == $0.left_key || key == $0.right_key }) {
+        return Unmanaged.passUnretained(event)
+    }
     let pid = event.getIntegerValueField(.eventSourceUnixProcessID)
     let is_uu = session.matches(pid)
+    // Only foreign modifier transitions are needed to protect local held keys.
+    guard is_uu || type == .flagsChanged else {
+        return Unmanaged.passUnretained(event)
+    }
     let before = event.flags.rawValue
     let now = DispatchTime.now().uptimeNanoseconds
     let protected_mask = modifier_specs.indices.reduce(UInt8(0)) { mask, index in
@@ -1293,10 +1336,12 @@ func callback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent,
     if keyboard_types.contains(type) {
         if is_uu {
             hid_keyboard_count += 1
-            var diagnostic = keyboard_diagnostic(event: event, stage: "hid", state: state, now: now)
-            diagnostic["remote_reason"] = remote_peer.keyboard_decision_reason
-            diagnostic["remote_protected_mask"] = protected_mask
-            if diagnostic["reason"] as? String != "observed" { logger.record("keyboard", diagnostic) }
+            if detailed_keyboard_diagnostics {
+                var diagnostic = keyboard_diagnostic(event: event, stage: "hid", state: state, now: now)
+                diagnostic["remote_reason"] = remote_peer.keyboard_decision_reason
+                diagnostic["remote_protected_mask"] = protected_mask
+                if diagnostic["reason"] as? String != "observed" { logger.record("keyboard", diagnostic) }
+            }
             if let correction = remote_decision, correction.flags != before {
                 event.flags = CGEventFlags(rawValue: correction.flags)
                 corrected_count += 1
@@ -1305,8 +1350,7 @@ func callback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent,
             }
         }
         // The remote matcher may adjust flags; keycode/text/type/time are untouched.
-    } else if type == .flagsChanged {
-        let key = event.getIntegerValueField(.keyboardEventKeycode)
+    } else if type == .flagsChanged, let key = modifier_key {
         let reason = state.observe(is_uu: is_uu, pid: pid, key: key, flags: before, timestamp: event.timestamp)
         if reason != "unwatched" {
             logger.record("modifier", ["pid": pid, "uu": is_uu, "keycode": key,
@@ -1315,30 +1359,13 @@ func callback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent,
                                        "reason": reason, "state": state.diagnostic()])
         }
     } else if mouse_types.contains(type) {
-        if is_uu { uu_mouse_count += 1 } else { foreign_mouse_count += 1 }
         let after = merge_remote_mouse_flags(offline_flags:state.corrected_flags(is_uu:is_uu,flags:before),correction:remote_decision)
-        if before != after { event.flags = CGEventFlags(rawValue: after); corrected_count += 1 }
-        let decisions = modifier_specs.indices.map { state.decision($0) }.joined(separator: ",")
-        let signature = "\(pid):\(before):\(after):\(decisions)"
-        let is_motion = type == .mouseMoved || type == .leftMouseDragged || type == .rightMouseDragged || type == .otherMouseDragged || type == .scrollWheel
-        // Preserve transitions/buttons; sample ordinary motion less frequently.
-        let sample_interval: UInt64 = (before & watched_bits) == 0 ? 1_000_000_000 : 100_000_000
-        if !is_motion || signature != last_motion_signature || now - last_motion_log >= sample_interval {
-            if before != after || ((before & watched_bits) != 0 && signature != last_motion_signature) {
-                let reason = !is_uu ? "source_not_uu" : before != after ? "released_modifier_cleared"
-                    : (before & watched_bits) == 0 ? "no_watched_flags" : "blocked_or_held"
-                logger.record("mouse", ["pid": pid, "uu": is_uu, "type": type.rawValue,
-                                        "callback_ns": String(now),
-                                        "reason": reason,
-                                        "event_ns": String(event.timestamp), "before": String(before, radix: 16),
-                                        "after": String(after, radix: 16), "state": state.diagnostic(),
-                                        "older_than_modifier": state.modifiers.map { event.timestamp < $0.uu.timestamp },
-                                        "sample_age_ns": String(now >= snapshot_time ? now - snapshot_time : 0),
-                                        "hid_flags": String(last_snapshot.hid_flags, radix: 16),
-                                        "session_flags": String(last_snapshot.session_flags, radix: 16)])
-                if is_motion { last_motion_signature = signature; last_motion_log = now }
-            }
-        } else { sampled_mouse_count += 1 }
+        if before != after {
+            event.flags = CGEventFlags(rawValue: after)
+            corrected_count += 1
+            logger.record("mouse", ["type": type.rawValue, "before": String(before, radix: 16),
+                                    "after": String(after, radix: 16)])
+        }
     }
     return Unmanaged.passUnretained(event)
 }
@@ -1374,7 +1401,7 @@ func start_monitoring() -> Bool {
         return false
     }
     refresh_session()
-    let mask = mouse_types.union(keyboard_types).union([.flagsChanged]).reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
+    let mask = monitored_event_types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
     event_tap = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap,
         options: .defaultTap, eventsOfInterest: mask, callback: callback, userInfo: nil)
     guard let tap = event_tap else {
@@ -1394,19 +1421,21 @@ func start_monitoring() -> Bool {
     event_run_source = run_source
     CFRunLoopAddSource(CFRunLoopGetMain(), run_source, .commonModes)
     CGEvent.tapEnable(tap: tap, enable: true)
-    // The second tap only observes; it never modifies events or the guard state.
-    let keyboard_mask = keyboard_types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
-    session_tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap,
-        options: .listenOnly, eventsOfInterest: keyboard_mask, callback: session_callback, userInfo: nil)
-    if let observer = session_tap, let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, observer, 0) {
-        session_run_source = source
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
-        CGEvent.tapEnable(tap: observer, enable: true)
-        logger.notice("键盘诊断已配置：输入层 HID + 会话层 session，仅记录按下/松开、时间和修饰标记。")
-    } else {
-        if let observer = session_tap { CFMachPortInvalidate(observer) }
-        session_tap = nil
-        logger.notice("会话层键盘监听创建失败；保留 HID 层诊断。日志不能完整比较两层。")
+    // Optional troubleshooting only: default operation uses a single input tap.
+    if detailed_keyboard_diagnostics {
+        let keyboard_mask = keyboard_types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
+        session_tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap,
+            options: .listenOnly, eventsOfInterest: keyboard_mask, callback: session_callback, userInfo: nil)
+        if let observer = session_tap, let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, observer, 0) {
+            session_run_source = source
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+            CGEvent.tapEnable(tap: observer, enable: true)
+            logger.notice("键盘诊断已配置：输入层 HID + 会话层 session，仅记录按下/松开、时间和修饰标记。")
+        } else {
+            if let observer = session_tap { CFMachPortInvalidate(observer) }
+            session_tap = nil
+            logger.notice("会话层键盘监听创建失败；保留 HID 层诊断。日志不能完整比较两层。")
+        }
     }
     var last_service_check: UInt64 = 0
     var last_status: UInt64 = 0
@@ -1427,7 +1456,6 @@ func start_monitoring() -> Bool {
             }
         }
         last_snapshot = system_snapshot()
-        snapshot_time = now
         if session.current != nil && CGEvent.tapIsEnabled(tap: tap) {
             let recovered = state.reconcile(snapshot: last_snapshot, now: now)
             if !recovered.isEmpty { logger.notice("已自动同步并启用修正：\(recovered.joined(separator: "、"))") }
@@ -1541,6 +1569,7 @@ if menu_bar_mode {
     controller.export_provider = {
         ["version": guard_version, "diagnostics": logger.snapshot(), "remote": remote_peer.diagnostic_summary(),
          "corrected_events": corrected_count, "hid_keyboard": hid_keyboard_count, "session_keyboard": session_keyboard_count,
+         "detailed_keyboard_diagnostics": detailed_keyboard_diagnostics,
          "input_source": input_guard.status_text, "state": state.diagnostic(),
          "tap_enabled": event_tap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false]
     }

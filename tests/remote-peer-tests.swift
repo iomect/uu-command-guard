@@ -166,7 +166,8 @@ import Darwin
               "future tolerance cannot bypass clock health")
         let protected = ready(); protected.mappings[1] = (0,8)
         protected.ingest([input(4,1_055_500,25,1)],gap:false,now:1_055_000)
-        check(protected.decide(observation(1_055_000,25),now:1_055_000,protected:1) == nil && protected.last_decision_reason == "local_modifier_protected",
+        let protected_decision = protected.decide(observation(1_055_000,25),now:1_055_000,protected:1)
+        check(protected_decision?.flags == 0 && protected_decision?.class_mask == 0 && protected_decision?.preserve_mask == 7 && protected.last_decision_reason == "local_modifier_protected",
               "future tolerance cannot bypass local modifier protection")
         let ambiguous = ready(); ambiguous.mappings[1] = (0,8)
         ambiguous.ingest([input(4,1_055_499,25,1),input(5,1_055_500,25,1)],gap:false,now:1_055_000)
@@ -238,7 +239,210 @@ import Darwin
         } else { check(false,"ordinary drain receives overflow invalidation") }
         check(!matcher.ready,"overflow publication invalidates learning before any further decision")
     }
+    static let target_flags = [CGEventFlags.maskCommand.rawValue,CGEventFlags.maskAlternate.rawValue,CGEventFlags.maskControl.rawValue]
+    static let target_sides: [[UInt64]] = [[8,16],[32,64],[1,8192]]
+    static func mapping_edge(_ matcher:PeerMatcher,_ id:UInt64,_ time:Int64,_ key:Int,_ target:Int,_ side:UInt64,_ down:Bool,
+                             mods:UInt16? = nil,flags:UInt64? = nil,observation_time:Int64? = nil) {
+        let state = mods ?? (down ? matcher.bit(key) : 0)
+        let raw = flags ?? (down ? target_flags[target]|side : 0)
+        matcher.ingest([input(id,UInt64(time),key,state,"modifier",down ? "down":"up")],gap:false,now:time)
+        var event = observation(observation_time ?? time+5000,0,raw,"modifier",down ? "down":"up")
+        event.modifier_class = target; event.side_bit = side
+        _ = matcher.decide(event,now:time+5000,protected:0)
+    }
+    static func timed_mapping_edge(_ matcher:PeerMatcher,_ id:UInt64,_ source_time:Int64,_ observation_time:Int64,_ callback_time:Int64,_ down:Bool) {
+        matcher.ingest([input(id,UInt64(source_time),224,down ? 1:0,"modifier",down ? "down":"up")],gap:false,now:callback_time)
+        var edge = observation(observation_time,0,down ? target_flags[2]|1:0,"modifier",down ? "down":"up")
+        edge.modifier_class = 2; edge.side_bit = 1
+        _ = matcher.decide(edge,now:callback_time,protected:0)
+    }
+    static func mapping_time_evidence() {
+        for confirmed in [false,true] {
+            let future = ready()
+            if confirmed { future.mappings = [1:(0,8),4:(1,32)] }
+            timed_mapping_edge(future,4,1_050_000,1_035_000,1_035_000,true)
+            check(future.last_pair_reason == "source_from_future" && future.last_consumed_id == 3 && future.consumed[4] == nil && future.delays.count == 3,
+                  "far-future modifier down is rejected before consumption or calibration")
+            check(future.mapping_edges.isEmpty && future.mappings.count == (confirmed ? 2:0),
+                  "far-future down cannot create pending evidence or revoke the confirmed configuration")
+            timed_mapping_edge(future,5,1_060_000,1_045_000,1_045_000,false)
+            check(future.last_pair_reason == "source_from_future" && future.last_consumed_id == 3 && future.consumed[5] == nil && future.delays.count == 3,
+                  "far-future modifier up is rejected before consumption")
+            check(future.mapping_edges.isEmpty && future.mappings.count == (confirmed ? 2:0) && (!confirmed || future.mappings[1]?.0 == 0),
+                  "a future down-up cycle cannot confirm a mapping or change an existing target")
+            let stale = ready()
+            if confirmed { stale.mappings = [1:(0,8),4:(1,32)] }
+            timed_mapping_edge(stale,4,1_050_000,1_055_000,1_550_001,true)
+            check(stale.last_pair_reason == "source_stale" && stale.last_consumed_id == 3 && stale.consumed[4] == nil && stale.delays.count == 3,
+                  "modifier down older than 500ms is rejected before consumption")
+            check(stale.mapping_edges.isEmpty && stale.mappings.count == (confirmed ? 2:0),
+                  "stale down cannot create pending evidence or revoke confirmed mappings")
+            timed_mapping_edge(stale,5,1_060_000,1_065_000,1_560_001,false)
+            check(stale.last_pair_reason == "source_stale" && stale.last_consumed_id == 3 && stale.consumed[5] == nil && stale.delays.count == 3,
+                  "modifier up older than 500ms is rejected before consumption")
+            check(stale.mapping_edges.isEmpty && stale.mappings.count == (confirmed ? 2:0) && (!confirmed || stale.mappings[1]?.0 == 0),
+                  "a stale down-up cycle cannot confirm or revoke the existing configuration")
+        }
+        let ahead_boundary = ready()
+        timed_mapping_edge(ahead_boundary,4,1_050_000,1_049_500,1_049_500,true)
+        check(ahead_boundary.mapping_edges[1]?.2 == 1 && ahead_boundary.consumed[4] != nil,
+              "modifier down ahead by exactly half RTT remains reliable evidence")
+        timed_mapping_edge(ahead_boundary,5,1_060_000,1_059_500,1_059_500,false)
+        check(ahead_boundary.mappings[1]?.0 == 2 && ahead_boundary.mappings[1]?.1 == 1 && ahead_boundary.consumed[5] != nil,
+              "modifier down-up at the half RTT boundary can verify an actual target")
+        let ahead_beyond = ready()
+        timed_mapping_edge(ahead_beyond,4,1_050_000,1_049_499,1_049_499,true)
+        check(ahead_beyond.mapping_edges.isEmpty && ahead_beyond.consumed[4] == nil && ahead_beyond.last_consumed_id == 3,
+              "modifier down ahead by half RTT plus one microsecond does not consume or learn")
+        timed_mapping_edge(ahead_beyond,5,1_060_000,1_059_499,1_059_499,false)
+        check(ahead_beyond.mappings.isEmpty && ahead_beyond.mapping_edges.isEmpty && ahead_beyond.consumed[5] == nil,
+              "modifier up beyond half RTT cannot finish an untrusted cycle")
+        let late_boundary = ready()
+        timed_mapping_edge(late_boundary,4,1_050_000,1_055_000,1_550_000,true)
+        check(late_boundary.mapping_edges[1]?.2 == 1 && late_boundary.consumed[4] != nil,
+              "a reliable modifier observation arriving exactly 500ms late can start a proof")
+        timed_mapping_edge(late_boundary,5,1_060_000,1_065_000,1_560_000,false)
+        check(late_boundary.mappings[1]?.0 == 2 && late_boundary.consumed[5] != nil,
+              "a reliable down-up proof at the 500ms callback boundary remains valid")
+        let stale_up = ready()
+        timed_mapping_edge(stale_up,4,1_050_000,1_055_000,1_055_000,true)
+        timed_mapping_edge(stale_up,5,1_060_000,1_065_000,1_560_001,false)
+        check(stale_up.mappings.isEmpty && stale_up.mapping_edges[1]?.2 == 1 && stale_up.consumed[5] == nil,
+              "an expired up cannot complete a previously trustworthy down edge")
+        let future_up = ready()
+        timed_mapping_edge(future_up,4,1_050_000,1_055_000,1_055_000,true)
+        timed_mapping_edge(future_up,5,1_060_000,1_059_499,1_059_499,false)
+        check(future_up.mappings.isEmpty && future_up.mapping_edges[1]?.2 == 1 && future_up.consumed[5] == nil,
+              "a future up cannot complete a previously trustworthy down edge")
+    }
+    static func dynamic_mappings() {
+        let keys = [224,227,226]
+        let bits = [1,4,16]
+        let shift = CGEventFlags.maskShift.rawValue
+        let all_flags = target_flags[0]|target_flags[1]|target_flags[2]|8|16|32|64|1|8192|shift
+        // Every three-source assignment is covered, including all six permutations
+        // and configurations where several sources converge on one target class.
+        for ctrl in 0..<3 { for win in 0..<3 { for alt in 0..<3 {
+            let targets = [ctrl,win,alt]
+            let matcher = ready()
+            for index in 0..<3 {
+                let id = UInt64(4+index*2)
+                let time = Int64(1_050_000+index*20_000)
+                mapping_edge(matcher,id,time,keys[index],targets[index],target_sides[targets[index]][0],true)
+                check(matcher.mappings[bits[index]] == nil,"assignment \(targets): down alone remains unverified")
+                mapping_edge(matcher,id+1,time+10_000,keys[index],targets[index],target_sides[targets[index]][0],false)
+                check(matcher.mappings[bits[index]]?.0 == targets[index] && matcher.mappings[bits[index]]?.1 == target_sides[targets[index]][0],
+                      "assignment \(targets): complete physical edge proves actual target")
+            }
+            var expected = shift
+            for target in Set(targets) { expected |= target_flags[target]|target_sides[target][0] }
+            matcher.ingest([input(10,1_120_000,25,21)],gap:false,now:1_120_000)
+            let corrected = matcher.decide(observation(1_125_000,25,all_flags),now:1_125_000,protected:0)
+            check(corrected?.flags == expected && corrected?.class_mask == 7 && corrected?.preserve_mask == 0,
+                  "assignment \(targets): active sources OR into targets and unused targets clear")
+            matcher.ingest([input(11,1_130_000,25,0)],gap:false,now:1_130_000)
+            check(matcher.decide(observation(1_135_000,25,all_flags),now:1_135_000,protected:0)?.flags == shift,
+                  "assignment \(targets): release clears every target and preserves Shift")
+            for protected in UInt8(1)...UInt8(7) {
+                let id = UInt64(11+Int(protected)); let time = Int64(1_140_000+Int(protected)*10_000)
+                matcher.ingest([input(id,UInt64(time),25,21)],gap:false,now:time)
+                let result = matcher.decide(observation(time+5000,25,all_flags),now:time+5000,protected:protected)
+                var protected_expected = expected
+                for target in 0..<3 where protected & (1 << target) != 0 {
+                    let class_flags = target_flags[target]|target_sides[target][0]|target_sides[target][1]
+                    protected_expected = (protected_expected & ~class_flags)|(all_flags & class_flags)
+                }
+                check(result?.flags == protected_expected && result?.class_mask == (7 & ~protected) && result?.preserve_mask == protected,
+                      "assignment \(targets): every local protection combination preserves its exact target bits")
+            }
+        } } }
+        let partial = ready()
+        mapping_edge(partial,4,1_050_000,224,2,8192,true)
+        mapping_edge(partial,5,1_060_000,224,2,8192,false)
+        partial.ingest([input(6,1_070_000,25,1)],gap:false,now:1_070_000)
+        let partial_result = partial.decide(observation(1_075_000,25,all_flags),now:1_075_000,protected:0)
+        check(partial_result?.flags == ((all_flags & ~(target_flags[2]|1|8192))|target_flags[2]|8192) && partial_result?.class_mask == 4 && partial_result?.preserve_mask == 3,
+              "partial source verification rebuilds its actual Control target only")
+        for (index,side) in peer_modifier_sides.filter({ $0.bit != 1 }).enumerated() {
+            let id = UInt64(7+index); let time = Int64(1_080_000+index*10_000)
+            partial.ingest([input(id,UInt64(time),25,UInt16(side.bit))],gap:false,now:time)
+            let result = partial.decide(observation(time+5000,25,all_flags),now:time+5000,protected:0)
+            check(result?.flags == all_flags && result?.class_mask == 0 && result?.preserve_mask == 7,
+                  "unverified active \(side.name) cannot clear any target class")
+            check(partial.last_decision_reason == (side.bit & (2|8|32) != 0 ? "unverified_active_right_modifier":"unverified_active_modifier"),
+                  "unverified active \(side.name) has the correct source-side diagnostic")
+        }
+        for (index,side) in peer_modifier_sides.enumerated() {
+            let matcher = ready(); let target = index % 3; let target_side = target_sides[target][index % 2]
+            let key = [224,228,227,231,226,230][index]
+            mapping_edge(matcher,4,1_050_000,key,target,target_side,true)
+            mapping_edge(matcher,5,1_060_000,key,target,target_side,false)
+            check(matcher.mappings[side.bit]?.0 == target && matcher.mappings[side.bit]?.1 == target_side,
+                  "each physical source side can learn a different target class and side")
+        }
+        let converged = ready()
+        mapping_edge(converged,4,1_050_000,224,0,8,true)
+        mapping_edge(converged,5,1_060_000,224,0,8,false)
+        mapping_edge(converged,6,1_070_000,227,0,16,true)
+        mapping_edge(converged,7,1_080_000,227,0,16,false)
+        converged.ingest([input(8,1_090_000,25,5)],gap:false,now:1_090_000)
+        let both_active = converged.decide(observation(1_095_000,25,shift),now:1_095_000,protected:0)
+        check(both_active?.flags == target_flags[0]|8|16|shift && both_active?.class_mask == 1 && both_active?.preserve_mask == 6,
+              "two sources converging on one target OR both proven device sides")
+        converged.ingest([input(9,1_100_000,25,4)],gap:false,now:1_100_000)
+        check(converged.decide(observation(1_105_000,25,target_flags[0]|8|16|shift),now:1_105_000,protected:0)?.flags == target_flags[0]|16|shift,
+              "releasing one converged source retains the other source's target side")
+        converged.ingest([input(10,1_110_000,25,0)],gap:false,now:1_110_000)
+        check(converged.decide(observation(1_115_000,25,target_flags[0]|16|shift),now:1_115_000,protected:0)?.flags == shift,
+              "releasing all converged sources clears only their proven target")
+        let ambiguous = ready(); ambiguous.mappings[1] = (0,8)
+        ambiguous.ingest([input(4,1_050_000,224,1,"modifier","down"),input(5,1_051_000,227,4,"modifier","down")],gap:false,now:1_051_000)
+        var ambiguous_event = observation(1_055_000,0,target_flags[0]|8,"modifier","down")
+        ambiguous_event.modifier_class = 0; ambiguous_event.side_bit = 8
+        _ = ambiguous.decide(ambiguous_event,now:1_055_000,protected:0)
+        check(ambiguous.last_pair_reason == "ambiguous_candidates" && ambiguous.mappings.count == 1 && ambiguous.mapping_edges.isEmpty,
+              "mixed source modifier candidates stay ambiguous despite an existing mapping")
+        let incorrect = ready()
+        mapping_edge(incorrect,4,1_050_000,224,0,8,true,mods:0)
+        check(incorrect.mappings.isEmpty && incorrect.mapping_edges.isEmpty,"source down without its own pressed bit cannot prove an edge")
+        mapping_edge(incorrect,5,1_060_000,224,0,8,false,mods:1)
+        check(incorrect.mappings.isEmpty && incorrect.mapping_edges.isEmpty,"source up retaining its own pressed bit cannot prove an edge")
+        mapping_edge(incorrect,6,1_070_000,224,0,8,true,flags:target_flags[0]|8|16)
+        check(incorrect.mappings.isEmpty && incorrect.mapping_edges.isEmpty,"mixed target device sides cannot prove an isolated raw edge")
+        let reversed = ready()
+        mapping_edge(reversed,4,1_050_000,224,1,32,false)
+        mapping_edge(reversed,5,1_060_000,224,1,32,true)
+        check(reversed.mappings.isEmpty,"up followed by down cannot complete a mapping cycle")
+        mapping_edge(reversed,6,1_070_000,224,1,32,false)
+        check(reversed.mappings[1]?.0 == 1,"a fresh down followed by up proves the mapping after an initial stray up")
+        let reversed_time = ready()
+        mapping_edge(reversed_time,4,1_050_000,224,0,8,true)
+        mapping_edge(reversed_time,5,1_060_000,224,0,8,false,observation_time:1_054_999)
+        check(reversed_time.mappings.isEmpty,"increasing source IDs cannot hide decreasing Mac edge times")
+        let changed = ready(); changed.mappings = [1:(0,8),4:(2,1),16:(1,32)]
+        mapping_edge(changed,4,1_050_000,224,2,1,true)
+        check(changed.mappings.isEmpty && Set(changed.mapping_edges.keys) == Set([1]),"a changed target revokes the whole confirmed configuration")
+        changed.ingest([input(3,1_040_000,224,0,"modifier","up")],gap:false,now:1_056_000)
+        var old_edge = observation(1_045_000,0,0,"modifier","up"); old_edge.modifier_class = 0; old_edge.side_bit = 8
+        _ = changed.decide(old_edge,now:1_056_000,protected:0)
+        check(changed.mappings.isEmpty,"old source and Mac edges cannot restore a revoked mapping")
+        mapping_edge(changed,5,1_060_000,224,2,1,false)
+        check(changed.mappings.count == 1 && changed.mappings[1]?.0 == 2,"new configuration requires a complete fresh matching cycle")
+        let idle = ready(); idle.mappings[1] = (2,1)
+        mapping_edge(idle,4,1_050_000,227,1,32,true)
+        idle.stream_clear(new_generation:true)
+        check(idle.mappings[1]?.0 == 2 && idle.mapping_edges[4] == nil,"same-window idle retains confirmed mappings but drops partial edges")
+        mapping_edge(idle,5,1_060_000,227,1,32,false)
+        check(idle.mappings[4] == nil,"generation boundaries cannot combine old down with new up")
+        idle.window_clear()
+        check(idle.mappings.isEmpty && idle.mapping_edges.isEmpty,"window changes revoke confirmed and partial mapping evidence")
+        let gap = ready(); gap.mappings[1] = (2,1)
+        gap.ingest([],gap:true,now:1_050_000)
+        check(gap.mappings.isEmpty && gap.mapping_edges.isEmpty,"source gaps revoke confirmed and partial mapping evidence")
+    }
     static func main() throws {
+        mapping_time_evidence()
+        dynamic_mappings()
         future_source_boundaries()
         publication_queue()
         let data = try Data(contentsOf:URL(fileURLWithPath:"protocol/sample.json"))
@@ -265,7 +469,8 @@ import Darwin
         let released = m.decide(observation(1_065_000,25,cmd|8|CGEventFlags.maskShift.rawValue),now:1_065_000,protected:0)
         check(released?.flags == CGEventFlags.maskShift.rawValue,"clear stale class, preserve shift")
         m.ingest([input(6,1_070_000,25,0)],gap:false,now:1_071_000)
-        check(m.decide(observation(1_075_000,25,cmd),now:1_075_000,protected:1) == nil,"foreign class protection")
+        let foreign_protected = m.decide(observation(1_075_000,25,cmd),now:1_075_000,protected:1)
+        check(foreign_protected?.flags == cmd && foreign_protected?.class_mask == 0 && foreign_protected?.preserve_mask == 7,"foreign class protection")
         check(m.last_decision_reason == "local_modifier_protected","local protection is diagnosed without bypassing it")
         let ambiguous = ready(); ambiguous.mappings = m.mappings
         ambiguous.ingest([input(4,1_050_000),input(5,1_051_000)],gap:false,now:1_052_000)
@@ -282,7 +487,8 @@ import Darwin
         let late = fresh()
         for n in 1...3 {
             let time = Int64(1_000_000+n*10_000)
-            check(late.decide(observation(time+5000),now:time+5000,protected:0) == nil,"forwarded observation unchanged")
+            let forwarded = late.decide(observation(time+5000),now:time+5000,protected:0)
+            check(forwarded == nil || (forwarded?.flags == 0 && forwarded?.class_mask == 0 && forwarded?.preserve_mask == 7),"forwarded observation unchanged")
             late.ingest([input(UInt64(n),UInt64(time))],gap:false,now:time+6000)
         }
         check(late.ready && late.corrected == 0,"late observations calibrate only")
@@ -293,8 +499,8 @@ import Darwin
         check(motion.decide(observation(1_105_000,0,0,"motion","move"),now:1_150_000,protected:0)?.flags == cmd|8,"whole motion interval stable proof")
         motion.ingest([],gap:true,now:1_160_000)
         check(motion.transitions.isEmpty && !motion.continuity,"gap destroys continuity")
-        check(motion.mappings.count == 2 && !motion.ready && motion.readiness_status_text.contains("重新学习"),
-              "gap status reports relearning even when modifier mapping remains verified")
+        check(motion.mappings.isEmpty && !motion.ready && motion.readiness_status_text.contains("重新学习"),
+              "gap revokes modifier mapping and reports relearning")
         motion.snapshot(time:1_170_000,mods:0,event_seq:5,now:1_170_000)
         check(motion.decide(observation(1_105_000,0,cmd,"motion","move"),now:1_180_000,protected:0) == nil,"snapshot never proves historical gap")
         let edges = fresh()
@@ -327,8 +533,8 @@ import Darwin
               "released left modifiers clear stale flags while preserving Shift")
         left_only.ingest([input(6,1_070_000,25,1|2)],gap:false,now:1_071_000)
         let right_unverified = left_only.decide(observation(1_075_000,25,cmd|16),now:1_075_000,protected:0)
-        check(right_unverified?.flags == cmd|16 && right_unverified?.class_mask == 6 && right_unverified?.preserve_mask == 1,
-              "an active unverified right Ctrl preserves the entire Command class")
+        check(right_unverified?.flags == cmd|16 && right_unverified?.class_mask == 0 && right_unverified?.preserve_mask == 7,
+              "an active unverified right Ctrl preserves all target classes")
         left_only.ingest([input(7,1_080_000,25,1)],gap:false,now:1_081_000)
         let left_protected = left_only.decide(observation(1_085_000,25),now:1_085_000,protected:1)
         check(left_protected?.flags == 0 && left_protected?.class_mask == 6,
@@ -343,7 +549,7 @@ import Darwin
         let right_only_unknown = ready(); right_only_unknown.mappings = [1:(0,8)]
         right_only_unknown.ingest([input(4,1_050_000,25,2)],gap:false,now:1_051_000)
         let preserved_only = right_only_unknown.decide(observation(1_055_000,25,cmd|16),now:1_055_000,protected:0)
-        check(preserved_only?.class_mask == 0 && preserved_only?.preserve_mask == 1 && preserved_only?.flags == cmd|16,
+        check(preserved_only?.class_mask == 0 && preserved_only?.preserve_mask == 7 && preserved_only?.flags == cmd|16,
               "preservation still returns when no other class can be corrected")
         let swapped_left = ready(); swapped_left.mappings = [1:(0,16)]
         swapped_left.ingest([input(4,1_050_000,25,1)],gap:false,now:1_051_000)
@@ -362,7 +568,8 @@ import Darwin
         _ = changed_mapping.decide(changed_down,now:1_055_000,protected:0)
         check(changed_mapping.mappings[1] == nil,"contradictory physical edge revokes previously verified mapping")
         changed_mapping.ingest([input(5,1_060_000,25,1)],gap:false,now:1_060_000)
-        check(changed_mapping.decide(observation(1_065_000,25),now:1_065_000,protected:0) == nil,
+        let contradicted = changed_mapping.decide(observation(1_065_000,25),now:1_065_000,protected:0)
+        check(contradicted?.flags == 0 && contradicted?.class_mask == 0 && contradicted?.preserve_mask == 7,
               "ordinary key is not corrected using a contradicted mapping")
         var changed_up = observation(1_075_000,0,0,"modifier","up")
         changed_up.modifier_class = 0; changed_up.side_bit = 16

@@ -107,7 +107,6 @@ type native_app struct {
 	event_id                              atomic.Uint64
 	overflow                              atomic.Bool
 	gap_reasons                           atomic.Uint32
-	motion_time                           atomic.Int64
 	lifecycle                             chan uintptr
 	lifecycle_lost                        atomic.Bool
 	dirty                                 atomic.Bool
@@ -416,7 +415,9 @@ func keyboard_proc(code int32, w, l uintptr) uintptr {
 	return v
 }
 func mouse_proc(code int32, w, l uintptr) uintptr {
-	if code >= 0 {
+	// Windows still invokes the shared mouse hook for motion (including drags).
+	// Pass it straight through without decoding, timestamps, focus checks or queues.
+	if code >= 0 && w != 0x200 {
 		a := native
 		k := (*mouse)(unsafe.Pointer(l))
 		if k.Flags&1 == 0 {
@@ -455,12 +456,6 @@ func mouse_proc(code int32, w, l uintptr) uintptr {
 					key = 4
 				}
 				a.push("wheel", key, "pulse")
-			case 0x200:
-				at := now_us()
-				old := a.motion_time.Load()
-				if at-old >= 10000 && a.motion_time.CompareAndSwap(old, at) {
-					a.push("motion", 0, "move")
-				}
 			}
 			if key > 0 && w != 0x20a && w != 0x20e {
 				a.push("button", key, action)
