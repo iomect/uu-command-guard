@@ -2,17 +2,17 @@
 
 用于网易 **UU远程** 的 **Windows 控制 Mac（macOS）** 场景，帮助排查和修复由 Command、Option、Control 标记丢失或残留引起的**快捷键冲突、快捷键失效**，例如 Ctrl+C 无法复制、Ctrl+V 无法粘贴或只输入 v，以及 Ctrl+A、Ctrl+X 等组合键异常。
 
-当前版本 **1.4.1**，Mac 内部版本 `2026-10-01.12`。采用 [MIT 许可证](LICENSE)，与 UU 官方无关联。
+当前版本 **1.4.2**，Mac 内部版本 `2026-10-01.13`。采用 [MIT 许可证](LICENSE)，与 UU 官方无关联。
 
-只修改已有事件的三个修饰标记，键码、文字、事件类型和时间戳保持原样，不补发或重放输入；修饰键事件本身只观察。Mac 另提供离线鼠标按钮/滚轮修补和微信输入法保持。
+主要修正已有事件的三个修饰标记；可选的小键盘 `+` 修复只修改该键的字符内容。键码、事件类型和时间戳保持原样，不补发或重放输入；修饰键事件本身只观察。Mac 另提供离线鼠标按钮/滚轮修补和微信输入法保持。
 
 ## 下载与安装
 
 | 平台 | 下载 |
 | --- | --- |
-| Apple Silicon Mac | [Mac arm64](https://github.com/iomect/uu-command-guard/releases/download/v1.4.1/UUCommandGuard-Mac-arm64.zip) |
-| Intel Mac | [Mac x86_64](https://github.com/iomect/uu-command-guard/releases/download/v1.4.1/UUCommandGuard-Mac-x86_64.zip) |
-| Windows x64 | [Windows x64](https://github.com/iomect/uu-command-guard/releases/download/v1.4.1/UUCommandBridge-Windows-x64.zip) |
+| Apple Silicon Mac | [Mac arm64](https://github.com/iomect/uu-command-guard/releases/download/v1.4.2/UUCommandGuard-Mac-arm64.zip) |
+| Intel Mac | [Mac x86_64](https://github.com/iomect/uu-command-guard/releases/download/v1.4.2/UUCommandGuard-Mac-x86_64.zip) |
+| Windows x64 | [Windows x64](https://github.com/iomect/uu-command-guard/releases/download/v1.4.2/UUCommandBridge-Windows-x64.zip) |
 
 [发布页](https://github.com/iomect/uu-command-guard/releases) 提供 SHA256 校验文件；ZIP 包含程序、许可证及安装说明。**请同时更新两端并先退出旧版。**
 
@@ -41,6 +41,8 @@ xattr -cr "/Applications/UU 修补工具.app"
 - 证据迟到、配对不唯一、时钟异常或未验证的源侧按住时保守跳过。本地 Mac 键盘按住和未同步的修饰类受到保护；修正计数不代表应用操作成功。
 
 退出远程窗口、源事件中断或对端停止后需重新同步输入；手动配置保留，自动模式需重新验证映射。同窗口单纯空闲保留已确认映射。只移动鼠标不会维持详细同步；启动、重连或唤醒后先松开修饰键，再正常输入或点击。
+
+Mac 菜单的“**修复 Windows 小键盘 +**”默认开启并独立保存。针对 Windows 小键盘 `+` 经 UU 输入成 `=` 的情况，只在局域网输入同步完成、且唯一配对到该源键时把当前按下事件的字符修正为 `+`；普通 `=` 和小键盘 `=` 不变。Ctrl/Win/Alt 组合键、本地输入、缺失或迟到证据及歧义配对保持原样；关闭后恢复原处理；切换后需正常输入或点击重新同步。该功能不更改物理键码，也不补发按键，实际字符效果需在目标应用中确认。
 
 “保持微信输入法”默认开启，可在菜单关闭并保存偏好。通过系统 TIS 接口保持已启用、可选择的 `com.tencent.inputmethod.wetype.pinyin` 模式（应用 bundle ID：`com.tencent.inputmethod.wetype`），不模拟按键、不自动安装或启用输入法，不改变微信内部中英文模式。
 

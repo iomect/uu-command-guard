@@ -130,6 +130,7 @@ extension RemotePeerBridge {
     }
 }
 let bridge = RemotePeerBridge(status_notice: { _ in }, local_port: 47733, peer_port: 47732)
+bridge.configure_keypad_plus(enabled: true)
 if fixture_manual_mode { bridge.configure_mapping(PeerManualMapping.default_mapping) }
 try bridge.configure(peer_ip: "127.0.0.1", enabled: true)
 bridge.check_manual_fixture_configuration()
@@ -154,6 +155,7 @@ for source_name in ["左Ctrl", "右Ctrl"] {
                  "real source modifier did not prove its configured target class")
 }
 precondition(corrections > 0, "real cross-language packets did not repair a keyboard event")
+precondition(bridge.diagnostic_summary()["keypad_plus_enabled"] as? Bool == true, "keypad repair default did not survive network configuration")
 bridge.check_manual_fixture_configuration()
 try Data().write(to: URL(fileURLWithPath: fixture_scope_reset_file))
 let scope_deadline = peer_now_us() + 2_000_000

@@ -2,7 +2,7 @@ import Foundation
 import CoreGraphics
 import Darwin
 
-struct RemoteFlagDecision { let flags: UInt64; let class_mask: UInt8; var preserve_mask: UInt8 = 0 }
+struct RemoteFlagDecision { let flags: UInt64; let class_mask: UInt8; var preserve_mask: UInt8 = 0; var keypad_plus_text: Bool = false }
 struct PeerInput: Codable {
     let id: UInt64; let time_us: UInt64; let window: String
     let kind: String; let key: Int; let action: String; let mods: UInt16
@@ -36,7 +36,7 @@ func peer_usb_key(_ code: Int64) -> Int? {
 }
 struct PeerObservation {
     var time: Int64; var kind: String; var key: Int; var action: String
-    var flags: UInt64; var modifier_class: Int?; var side_bit: UInt64 = 0
+    var flags: UInt64; var modifier_class: Int?; var side_bit: UInt64 = 0; var keypad_plus_alias: Bool = false
 }
 let peer_modifier_sides: [(bit: Int, name: String)] = [
     (1,"左Ctrl"),(2,"右Ctrl"),(4,"左Win"),(8,"右Win"),(16,"左Alt"),(32,"右Alt")
@@ -65,6 +65,7 @@ final class PeerMatcher {
     var mappings: [Int: (Int, UInt64)] = [:]
     private(set) var manual_mapping: PeerManualMapping?
     private(set) var manual_mapping_conflict = false
+    private(set) var keypad_plus_enabled = false
     private var manual_verified: Set<Int> = []
     private var configuration_boundary: Int64 = 0
     var mapping_edges: [Int: (Int, UInt64, UInt8)] = [:]
@@ -92,6 +93,13 @@ final class PeerMatcher {
         manual_mapping = configuration
         manual_mapping_conflict = false
         configuration_boundary = now
+        last_consumed_id = max(last_consumed_id,max(highest_id,source.map(\.id).max() ?? 0))
+        window_clear(now:now)
+    }
+    func configure_keypad_plus(enabled: Bool, now: Int64 = 0) {
+        guard keypad_plus_enabled != enabled else { return }
+        keypad_plus_enabled = enabled
+        configuration_boundary = max(configuration_boundary,now)
         last_consumed_id = max(last_consumed_id,max(highest_id,source.map(\.id).max() ?? 0))
         window_clear(now:now)
     }
@@ -177,7 +185,8 @@ final class PeerMatcher {
         if observation.kind == "modifier" {
             return bit(event.key) != 0 && observation.modifier_class.map { aggregate.indices.contains($0) } == true
         }
-        return event.key == observation.key
+        return event.key == observation.key || (keypad_plus_enabled && observation.keypad_plus_alias &&
+            observation.kind == "key" && event.key == 87 && [46,103].contains(observation.key))
     }
     func candidates(_ observation: PeerObservation, now: Int64) -> [PeerInput] {
         source.filter { event in
@@ -334,6 +343,7 @@ final class PeerMatcher {
         last_decision_reason = "motion_history_unavailable"
         let was_ready = ready
         var mods: UInt16?
+        var matched_keypad_plus = false
         if observation.kind == "motion" {
             if healthy(now), ready, continuity, hole_since == nil {
                 let center = observation.time - delay(); let radius = Int64(25_000+rtt/2)
@@ -351,6 +361,10 @@ final class PeerMatcher {
             else if now-source_time > 500_000 { last_decision_reason = "source_stale" }
             else {
                 mods = matched.mods
+                matched_keypad_plus = keypad_plus_enabled && observation.kind == "key" &&
+                    observation.action == "down" && matched.key == 87 &&
+                    matched.mods & 63 == 0 && protected == 0 &&
+                    observation.flags & aggregate.reduce(0, |) == 0
                 if last_decision_future_ahead_us > 0 { future_tolerance_accepts &+= 1 }
             }
         } else {
@@ -387,13 +401,15 @@ final class PeerMatcher {
             for mapping in active { flags |= mapping.1 }
         }
         guard mask != 0 else {
-            last_decision_reason = mappings.values.contains { valid_mapping($0) } ? "local_modifier_protected" : "mapping_unverified"
-            skipped &+= 1
-            return RemoteFlagDecision(flags:observation.flags,class_mask:0,preserve_mask:preserve_mask)
+            last_decision_reason = matched_keypad_plus ? "keypad_plus_text_corrected" :
+                (mappings.values.contains { valid_mapping($0) } ? "local_modifier_protected" : "mapping_unverified")
+            if matched_keypad_plus { corrected &+= 1 } else { skipped &+= 1 }
+            return RemoteFlagDecision(flags:observation.flags,class_mask:0,preserve_mask:preserve_mask,keypad_plus_text:matched_keypad_plus)
         }
-        last_decision_reason = flags == observation.flags ? "matched_flags_unchanged" : "flags_corrected"
-        if flags != observation.flags { corrected &+= 1 }
-        return RemoteFlagDecision(flags: flags, class_mask: mask, preserve_mask: preserve_mask)
+        last_decision_reason = matched_keypad_plus ? "keypad_plus_text_corrected" :
+            (flags == observation.flags ? "matched_flags_unchanged" : "flags_corrected")
+        if flags != observation.flags || matched_keypad_plus { corrected &+= 1 }
+        return RemoteFlagDecision(flags: flags, class_mask: mask, preserve_mask: preserve_mask, keypad_plus_text:matched_keypad_plus)
     }
 }
 struct PeerPublication {
@@ -532,6 +548,17 @@ final class RemotePeerBridge {
     var corrected_count: UInt64 { matcher.corrected }
     var skipped_count: UInt64 { matcher.skipped }
     var manual_mapping: PeerManualMapping? { matcher.manual_mapping }
+    var keypad_plus_enabled: Bool { matcher.keypad_plus_enabled }
+    func configure_keypad_plus(enabled: Bool) {
+        _ = drain_publications()
+        guard matcher.keypad_plus_enabled != enabled else { return }
+        matcher.configure_keypad_plus(enabled:enabled,now:Int64(peer_now_us()))
+        binding_requested = ""
+        if main_enabled && cache_connected && !cached_transport.error_active {
+            status_value = matcher.readiness_status_text
+            notice(status_value)
+        }
+    }
     var keyboard_decision_reason: String { last_keyboard_decision["reason"] as? String ?? "not_attempted" }
     func configure_mapping(_ configuration: PeerManualMapping?) {
         _ = drain_publications()
@@ -901,6 +928,7 @@ final class RemotePeerBridge {
         } else if type == .keyDown || type == .keyUp {
             guard let key = peer_usb_key(event.getIntegerValueField(.keyboardEventKeycode)) else { return nil }
             result.kind = "key"; result.key = key; result.action = type == .keyDown ? "down" : "up"
+            result.keypad_plus_alias = matcher.keypad_plus_enabled && [46,87,103].contains(key)
         } else if [.leftMouseDown,.leftMouseUp,.rightMouseDown,.rightMouseUp,.otherMouseDown,.otherMouseUp].contains(type) {
             result.kind = "button"; result.key = Int(event.getIntegerValueField(.mouseEventButtonNumber))+1
             result.action = [.leftMouseDown,.rightMouseDown,.otherMouseDown].contains(type) ? "down":"up"
@@ -966,7 +994,7 @@ final class RemotePeerBridge {
         ["status":status_value,"connected":cache_connected,"transport":cached_transport.summary,"corrected":matcher.corrected,"skipped":matcher.skipped,
          "window_learned":matcher.ready,"verified_modifier_sides":peer_modifier_sides.filter { matcher.verified_mapping($0.bit) }.count,
          "mapping_mode":matcher.manual_mapping == nil ? "automatic" : "manual",
-         "manual_mapping_conflict":matcher.manual_mapping_conflict,
+         "manual_mapping_conflict":matcher.manual_mapping_conflict,"keypad_plus_enabled":matcher.keypad_plus_enabled,
          "required_modifiers":peer_required_modifier_sides.map(\.name),"required_modifier_sides":3,
          "verified_required_modifier_sides":peer_required_modifier_sides.filter { matcher.verified_mapping($0.bit) }.count,
          "unverified_modifiers":peer_required_modifier_sides.filter { !matcher.verified_mapping($0.bit) }.map(\.name),

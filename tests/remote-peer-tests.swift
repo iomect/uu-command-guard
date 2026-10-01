@@ -666,8 +666,158 @@ import Darwin
         let stale_summary = stale.diagnostic_summary()["transport"] as? [String:Any] ?? [:]
         check(stale.status_text == "辅助同步已暂停" && stale_summary["send_error_active"] as? Bool == false,"obsolete configuration error publication cannot revive paused connection")
     }
+    static func keypad_plus() {
+        func calibrated(enabled: Bool = true) -> PeerMatcher {
+            let m = fresh()
+            m.configure_keypad_plus(enabled:enabled,now:1)
+            for n in 1...3 {
+                let time = UInt64(1_000_000+n*10_000)
+                m.ingest([input(UInt64(n),time)],gap:false,now:Int64(time))
+                _ = m.decide(observation(Int64(time)+5000),now:Int64(time)+5000,protected:0)
+            }
+            return m
+        }
+        func plus_observation(_ key: Int = 46, flags: UInt64 = 0, action: String = "down") -> PeerObservation {
+            var o = observation(1_055_000,key,flags,"key",action)
+            o.keypad_plus_alias = true
+            return o
+        }
+        check(!fresh().keypad_plus_enabled,"keypad plus opt-in defaults disabled")
+        for key in [46,87,103] {
+            let m = calibrated()
+            m.ingest([input(4,1_050_000,87)],gap:false,now:1_050_000)
+            let d = m.decide(plus_observation(key),now:1_055_000,protected:0)
+            check(d?.keypad_plus_text == true && d?.flags == 0 && d?.class_mask == 0,
+                  "verified current keypad plus corrects each allowed observed physical position without requiring modifier mappings")
+            check(m.last_decision_reason == "keypad_plus_text_corrected","keypad repair has fixed diagnostic reason")
+        }
+        for mapping_enabled in [false,true] {
+            let m = calibrated()
+            if mapping_enabled { m.mappings = PeerManualMapping.default_mapping.mappings }
+            let prior_corrected = m.corrected; let prior_skipped = m.skipped
+            m.ingest([input(4,1_050_000,87)],gap:false,now:1_050_000)
+            let d = m.decide(plus_observation(),now:1_055_000,protected:0)
+            check(d?.keypad_plus_text == true && d?.flags == 0 && m.corrected == prior_corrected+1 && m.skipped == prior_skipped,
+                  "text-only repair counts as corrected without skipping, with or without modifier mappings")
+            check(m.decide(plus_observation(),now:1_056_000,protected:0) == nil && m.corrected == prior_corrected+1,
+                  "consumed keypad input cannot count as a second correction")
+        }
+        let combined = calibrated(); combined.mappings = PeerManualMapping.default_mapping.mappings
+        let combined_corrected = combined.corrected; let combined_skipped = combined.skipped
+        combined.ingest([input(4,1_050_000,87)],gap:false,now:1_050_000)
+        let combined_decision = combined.decide(plus_observation(flags:8),now:1_055_000,protected:0)
+        check(combined_decision?.keypad_plus_text == true && combined_decision?.flags == 0 &&
+              combined.corrected == combined_corrected+1 && combined.skipped == combined_skipped,
+              "device flag plus text correction counts the same event exactly once")
+        for key in [46,87,103] {
+            let m = calibrated(enabled:false)
+            m.ingest([input(4,1_050_000,87)],gap:false,now:1_050_000)
+            check(m.decide(plus_observation(key),now:1_055_000,protected:0)?.keypad_plus_text != true,
+                  "disabled feature does not rewrite plus or equals")
+        }
+        for key in [46,103] {
+            let m = calibrated()
+            m.ingest([input(4,1_050_000,key)],gap:false,now:1_050_000)
+            check(m.decide(plus_observation(key),now:1_055_000,protected:0)?.keypad_plus_text == false,
+                  "ordinary equals and true keypad equals retain their exact source identity")
+            let ambiguous = calibrated()
+            ambiguous.ingest([input(4,1_050_000,key),input(5,1_050_100,87)],gap:false,now:1_050_100)
+            check(ambiguous.decide(plus_observation(key),now:1_055_000,protected:0) == nil && ambiguous.last_decision_reason == "ambiguous_candidates",
+                  "exact equals and keypad alias candidates remain ambiguous together")
+        }
+        let disallowed = calibrated()
+        disallowed.ingest([input(4,1_050_000,87)],gap:false,now:1_050_000)
+        check(disallowed.decide(plus_observation(4),now:1_055_000,protected:0) == nil,"alias cannot match other physical input")
+        let not_alias = calibrated()
+        not_alias.ingest([input(4,1_050_000,87)],gap:false,now:1_050_000)
+        check(not_alias.decide(observation(1_055_000,46),now:1_055_000,protected:0) == nil,"alias requires explicit observation eligibility")
+        for mods: UInt16 in [1,2,4,8,16,32] {
+            let m = calibrated()
+            m.mappings = PeerManualMapping.default_mapping.mappings
+            m.ingest([input(4,1_050_000,87,mods)],gap:false,now:1_050_000)
+            check(m.decide(plus_observation(),now:1_055_000,protected:0)?.keypad_plus_text != true,
+                  "all left and right remote shortcut modifiers prevent text rewrite")
+        }
+        for flag in [CGEventFlags.maskCommand,CGEventFlags.maskAlternate,CGEventFlags.maskControl] {
+            let m = calibrated()
+            m.ingest([input(4,1_050_000,87)],gap:false,now:1_050_000)
+            check(m.decide(plus_observation(flags:flag.rawValue),now:1_055_000,protected:0)?.keypad_plus_text != true,
+                  "local aggregate modifier prevents text rewrite even if flags correction is available")
+        }
+        for protection: UInt8 in [1,2,4,7] {
+            let m = calibrated()
+            m.ingest([input(4,1_050_000,87)],gap:false,now:1_050_000)
+            check(m.decide(plus_observation(),now:1_055_000,protected:protection)?.keypad_plus_text != true,
+                  "local modifier protection prevents plus rewrite")
+        }
+        let shifted = calibrated()
+        shifted.ingest([input(4,1_050_000,87,64),input(5,1_060_000,87,64)],gap:false,now:1_060_000)
+        check(shifted.decide(plus_observation(flags:CGEventFlags.maskShift.rawValue),now:1_055_000,protected:0) == nil,
+              "repeat candidates still require unique matching")
+        let repeats = calibrated()
+        for n in 4...5 {
+            let t = UInt64(1_050_000+(n-4)*40_000)
+            repeats.ingest([input(UInt64(n),t,87,64)],gap:false,now:Int64(t))
+            var o = plus_observation(flags:CGEventFlags.maskShift.rawValue); o.time = Int64(t)+5000
+            let d = repeats.decide(o,now:o.time,protected:0)
+            check(d?.keypad_plus_text == true && d?.flags == CGEventFlags.maskShift.rawValue,"Shift and repeated down are supported without changing flags")
+        }
+        let up = calibrated()
+        up.ingest([input(4,1_050_000,87,0,"key","up")],gap:false,now:1_050_000)
+        check(up.decide(plus_observation(action:"up"),now:1_055_000,protected:0)?.keypad_plus_text == false,"key up remains unchanged")
+        let learning = fresh(); learning.configure_keypad_plus(enabled:true,now:1)
+        learning.ingest([input(1,1_050_000,87)],gap:false,now:1_050_000)
+        check(learning.decide(plus_observation(),now:1_055_000,protected:0) == nil,"uncalibrated window does not repair plus")
+        let stale = calibrated(); stale.ingest([input(4,1_050_000,87)],gap:false,now:1_050_000)
+        check(stale.decide(plus_observation(),now:1_550_001,protected:0) == nil && stale.last_decision_reason == "source_stale","stale source does not rewrite plus")
+        let future = calibrated(); future.ingest([input(4,1_055_501,87)],gap:false,now:1_055_000)
+        check(future.decide(plus_observation(),now:1_055_000,protected:0) == nil && future.last_decision_reason == "source_from_future","future source beyond clock uncertainty does not rewrite plus")
+        let unhealthy = calibrated(); unhealthy.ingest([input(4,1_050_000,87)],gap:false,now:1_050_000); unhealthy.offset = nil
+        check(unhealthy.decide(plus_observation(),now:1_055_000,protected:0) == nil,"unhealthy clock cannot repair plus")
+        let hole = calibrated(); hole.ingest([input(5,1_050_000,87)],gap:false,now:1_050_000)
+        check(hole.decide(plus_observation(),now:1_055_000,protected:0) == nil && hole.last_decision_reason == "sequence_hole","sequence hole prevents plus repair")
+        let gap = calibrated(); gap.ingest([input(4,1_050_000,87)],gap:true,now:1_050_000)
+        check(gap.decide(plus_observation(),now:1_055_000,protected:0)?.keypad_plus_text != true,"source gap revokes plus calibration")
+        let late = calibrated()
+        check(late.decide(plus_observation(),now:1_055_000,protected:0) == nil,"missing plus source is not synthesized")
+        late.ingest([input(4,1_050_000,87)],gap:false,now:1_060_000)
+        check(late.late_keyboard_calibrations == 1 && late.observations.isEmpty,"late plus source is only calibration and cannot rewrite an already delivered event")
+        let conflict = calibrated()
+        conflict.configure_mapping(.default_mapping,now:1_040_000)
+        mapping_edge(conflict,4,1_050_000,224,2,1,true)
+        check(conflict.manual_mapping_conflict,"configured contradiction locks keypad repair too")
+        conflict.configure_keypad_plus(enabled:false,now:1_060_000)
+        conflict.configure_keypad_plus(enabled:true,now:1_070_000)
+        check(conflict.manual_mapping_conflict && conflict.manual_mapping == .default_mapping,"keypad option cannot clear a manual conflict or mapping setting")
+        // Establish calibration without changing the conflict latch.
+        conflict.learned_window = "window"; conflict.delays = [5000,5000,5000]
+        conflict.ingest([input(5,1_080_000,87)],gap:false,now:1_080_000)
+        var conflict_o = plus_observation(); conflict_o.time = 1_085_000
+        check(conflict.decide(conflict_o,now:1_085_000,protected:0)?.keypad_plus_text == false,"manual conflict blocks otherwise matched keypad repair")
+        let switched = calibrated()
+        switched.ingest([input(4,1_050_000,87)],gap:false,now:1_050_000)
+        switched.observations = [plus_observation()]
+        switched.configure_keypad_plus(enabled:false,now:1_060_000)
+        check(!switched.ready && switched.source.isEmpty && switched.observations.isEmpty && switched.offset == 0 && switched.last_consumed_id == 4,
+              "option change clears calibration and pending input while retaining network clock and consumption watermark")
+        switched.configure_keypad_plus(enabled:true,now:1_070_000)
+        switched.learned_window = "window"; switched.delays = [5000,5000,5000]
+        switched.ingest([input(5,1_050_000,87)],gap:false,now:1_075_000)
+        check(switched.decide(plus_observation(),now:1_075_000,protected:0) == nil && switched.last_decision_reason == "stale_configuration_observation",
+              "pre-option observation cannot cross the configuration boundary")
+        var fresh_o = plus_observation(); fresh_o.time = 1_075_000
+        check(switched.decide(fresh_o,now:1_075_000,protected:0) == nil,"old source cannot match a new observation after toggling")
+        let unchanged = calibrated(); unchanged.configure_keypad_plus(enabled:true,now:1_060_000)
+        check(unchanged.ready,"unchanged option does not unnecessarily relearn")
+        let bridge = RemotePeerBridge(status_notice:{ _ in })
+        bridge.configure_keypad_plus(enabled:true)
+        check(bridge.keypad_plus_enabled && bridge.diagnostic_summary()["keypad_plus_enabled"] as? Bool == true && bridge.status_text == "辅助同步未配置",
+              "bridge exposes option metadata without pretending a connection or exporting input content")
+        bridge.stop()
+    }
     static func main() throws {
         try transport_diagnostics()
+        keypad_plus()
         manual_mappings()
         mapping_time_evidence()
         dynamic_mappings()

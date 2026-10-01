@@ -5,7 +5,7 @@ import ApplicationServices
 import Carbon
 import Darwin
 
-let guard_version = "2026-10-01.12"
+let guard_version = "2026-10-01.13"
 let detailed_keyboard_diagnostics = CommandLine.arguments.contains("--diagnostic-session")
 let recovery_interval: UInt64 = 300_000_000
 let log_retention_seconds: TimeInterval = 3600
@@ -471,6 +471,20 @@ func input_source_preferences() -> UserDefaults {
     return UserDefaults(suiteName: domain) ?? UserDefaults.standard
 }
 
+let keypad_plus_preference_key = "fix_windows_keypad_plus"
+func keypad_plus_preference(_ preferences: UserDefaults) -> Bool {
+    (preferences.object(forKey: keypad_plus_preference_key) as? Bool) ?? true
+}
+// A narrow opt-in text exception: never change the physical down/up key identity.
+func apply_remote_keypad_plus(event: CGEvent, type: CGEventType, is_uu: Bool,
+                              enabled: Bool, decision: RemoteFlagDecision?) -> Bool {
+    guard is_uu, enabled, type == .keyDown, decision?.keypad_plus_text == true,
+          [24,69,81].contains(event.getIntegerValueField(.keyboardEventKeycode)) else { return false }
+    let plus: [UniChar] = [0x2b]
+    event.keyboardSetUnicodeString(stringLength: 1, unicodeString: plus)
+    return true
+}
+
 // Parse only an integer property-list array; malformed stored values select automatic mode.
 func stored_manual_mapping(_ value: Any?) -> PeerManualMapping? {
     guard let values = value as? [Any], values.count == 3 else { return nil }
@@ -772,6 +786,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let count_item = NSMenuItem()
     private let input_source_item = NSMenuItem()
     private let input_source_toggle = NSMenuItem(title: "保持微信输入法", action: #selector(toggle_input_source), keyEquivalent: "")
+    private let keypad_plus_toggle = NSMenuItem(title: "修复 Windows 小键盘 +", action: #selector(toggle_keypad_plus), keyEquivalent: "")
     private let peer_item = NSMenuItem()
     private let peer_counts_item = NSMenuItem()
     private let peer_toggle = NSMenuItem(title: "局域网辅助同步", action: #selector(toggle_peer), keyEquivalent: "")
@@ -786,6 +801,8 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var quit_handler: () -> Void = {}
     var input_source_provider: () -> (Bool, String) = { (false, "未启用") }
     var input_source_handler: () -> Void = {}
+    var keypad_plus_provider: () -> Bool = { true }
+    var keypad_plus_handler: () -> Void = {}
     var peer_provider: () -> (Bool, String, UInt64, UInt64) = { (false, "未配置对端 IP", 0, 0) }
     var peer_handler: () -> Void = {}
     var peer_ip_provider: () -> String = { "" }
@@ -824,6 +841,9 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(input_source_toggle)
         input_source_item.isEnabled = false
         menu.addItem(input_source_item)
+        keypad_plus_toggle.target = self
+        keypad_plus_toggle.isEnabled = !preview
+        menu.addItem(keypad_plus_toggle)
         menu.addItem(.separator())
         peer_toggle.target = self
         peer_toggle.isEnabled = !preview
@@ -879,6 +899,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let input_status = input_source_provider()
         input_source_toggle.state = input_status.0 ? .on : .off
         input_source_item.title = "输入法：\(input_status.1)"
+        keypad_plus_toggle.state = keypad_plus_provider() ? .on : .off
         let peer_status = peer_provider()
         peer_toggle.state = peer_status.0 ? .on : .off
         peer_item.title = "辅助：\(peer_status.1)"
@@ -891,6 +912,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) { refresh() }
     @objc private func retry_start() { retry_handler(); refresh() }
     @objc private func toggle_input_source() { input_source_handler(); refresh() }
+    @objc private func toggle_keypad_plus() { keypad_plus_handler(); refresh() }
     @objc private func toggle_peer() { peer_handler(); refresh() }
     @objc func open_mapping_settings() {
         if mapping_settings == nil {
@@ -1357,6 +1379,53 @@ func self_test() throws {
           "unmatched mouse retains original flags across offline merging during conflict")
     manual_peer.configure_mapping(nil,now:1_045_000)
     check(manual_peer.mappings.isEmpty && !manual_peer.manual_mapping_conflict,"automatic mode revokes manual assumptions")
+    let keypad_test_domain = "local.uu-command-guard.self-test." + UUID().uuidString
+    guard let keypad_test_preferences = UserDefaults(suiteName:keypad_test_domain) else {
+        preconditionFailure("cannot create isolated keypad test preferences")
+    }
+    defer { keypad_test_preferences.removePersistentDomain(forName:keypad_test_domain) }
+    check(keypad_plus_preference(keypad_test_preferences),"keypad repair defaults on")
+    keypad_test_preferences.set(false,forKey:keypad_plus_preference_key)
+    check(!keypad_plus_preference(UserDefaults(suiteName:keypad_test_domain)!),
+          "saved keypad repair off is read by a new preferences instance")
+    keypad_test_preferences.set(true,forKey:keypad_plus_preference_key)
+    check(keypad_plus_preference(UserDefaults(suiteName:keypad_test_domain)!),
+          "saved keypad repair on is read by a new preferences instance")
+    func test_event_text(_ event: CGEvent) -> [UniChar] {
+        var characters = [UniChar](repeating:0,count:4)
+        var length = 0
+        event.keyboardGetUnicodeString(maxStringLength:4,actualStringLength:&length,unicodeString:&characters)
+        return Array(characters.prefix(length))
+    }
+    let keypad_decision = RemoteFlagDecision(flags:0,class_mask:0,keypad_plus_text:true)
+    for key: Int64 in [24,69,81] {
+        let event = CGEvent(keyboardEventSource:nil,virtualKey:CGKeyCode(key),keyDown:true)!
+        event.timestamp = 123_000; event.flags = .maskShift
+        event.setIntegerValueField(.keyboardEventAutorepeat,value:1)
+        let equals: [UniChar] = [0x3d]
+        event.keyboardSetUnicodeString(stringLength:1,unicodeString:equals)
+        check(apply_remote_keypad_plus(event:event,type:.keyDown,is_uu:true,enabled:true,decision:keypad_decision),
+              "verified keypad text correction applies to supported Mac representations")
+        check(test_event_text(event) == [0x2b],"keypad text becomes a single plus")
+        check(event.type == .keyDown && event.timestamp == 123_000 && event.flags == .maskShift
+              && event.getIntegerValueField(.keyboardEventKeycode) == key
+              && event.getIntegerValueField(.keyboardEventAutorepeat) == 1,
+              "keypad correction preserves key identity type timestamp flags and repeat")
+    }
+    let untouched_keypad = CGEvent(keyboardEventSource:nil,virtualKey:24,keyDown:true)!
+    let equals: [UniChar] = [0x3d]
+    untouched_keypad.keyboardSetUnicodeString(stringLength:1,unicodeString:equals)
+    for request in [(false,true,CGEventType.keyDown,keypad_decision as RemoteFlagDecision?),
+                    (true,false,.keyDown,keypad_decision), (true,true,.keyUp,keypad_decision),
+                    (true,true,.keyDown,nil), (true,true,.keyDown,RemoteFlagDecision(flags:0,class_mask:0))] {
+        check(!apply_remote_keypad_plus(event:untouched_keypad,type:request.2,is_uu:request.0,
+                                       enabled:request.1,decision:request.3)
+              && test_event_text(untouched_keypad) == [0x3d],
+              "local disabled released and unproved input content remains untouched")
+    }
+    untouched_keypad.setIntegerValueField(.keyboardEventKeycode,value:9)
+    check(!apply_remote_keypad_plus(event:untouched_keypad,type:.keyDown,is_uu:true,enabled:true,decision:keypad_decision),
+          "other ordinary keys cannot use the keypad text exception")
     var transport_diagnostic = PeerTransportDiagnostics()
     transport_diagnostic.sent(result:-1,error:EHOSTUNREACH)
     check(transport_diagnostic.error_active && transport_diagnostic.last_send_errno == EHOSTUNREACH,
@@ -1547,14 +1616,21 @@ func callback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent,
                 diagnostic["remote_protected_mask"] = protected_mask
                 if diagnostic["reason"] as? String != "observed" { logger.record("keyboard", diagnostic) }
             }
+            var changed = false
             if let correction = remote_decision, correction.flags != before {
                 event.flags = CGEventFlags(rawValue: correction.flags)
-                corrected_count += 1
+                changed = true
                 logger.record("remote_correction", ["event_type": type.rawValue,
                     "before": String(before, radix: 16), "after": String(correction.flags, radix: 16)])
             }
+            if apply_remote_keypad_plus(event:event,type:type,is_uu:is_uu,
+                                        enabled:remote_peer.keypad_plus_enabled,decision:remote_decision) {
+                changed = true
+                logger.record("keypad_plus_correction", ["event_type": type.rawValue])
+            }
+            if changed { corrected_count += 1 }
         }
-        // The remote matcher may adjust flags; keycode/text/type/time are untouched.
+        // Keypad + is the only optional text exception; keycode/type/time remain untouched.
     } else if type == .flagsChanged, let key = modifier_key {
         let reason = state.observe(is_uu: is_uu, pid: pid, key: key, flags: before, timestamp: event.timestamp)
         if reason != "unwatched" {
@@ -1721,6 +1797,7 @@ func shutdown(_ code: Int32 = 0) -> Never {
 
 logger.notice("UU 修补工具 \(guard_version)；诊断仅保存在内存，按需导出。")
 let input_preferences = input_source_preferences()
+remote_peer.configure_keypad_plus(enabled:keypad_plus_preference(input_preferences))
 let input_guard = InputSourceGuard(record: { kind, fields in logger.record(kind, fields) })
 input_source_guard = input_guard
 input_guard.set_enabled((input_preferences.object(forKey: "keep_wechat_input_source") as? Bool) ?? true)
@@ -1751,6 +1828,12 @@ if menu_bar_mode {
         let enabled = !input_guard.enabled
         input_preferences.set(enabled, forKey: "keep_wechat_input_source")
         input_guard.set_enabled(enabled)
+    }
+    controller.keypad_plus_provider = { remote_peer.keypad_plus_enabled }
+    controller.keypad_plus_handler = {
+        let enabled = !remote_peer.keypad_plus_enabled
+        input_preferences.set(enabled, forKey:keypad_plus_preference_key)
+        remote_peer.configure_keypad_plus(enabled:enabled)
     }
     controller.peer_provider = {
         ((input_preferences.object(forKey: "remote_peer_enabled") as? Bool) ?? true,
