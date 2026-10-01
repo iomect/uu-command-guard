@@ -2,6 +2,7 @@
 
 - 公开仓库只提交源码、测试、构建脚本和通用文档；个人地址、路径、运行报告、日志、配置、应用替身、构建产物及历史源码压缩包不进入 Git。提交前检查暂存区，提交作者使用 GitHub noreply 邮箱；许可证见 `LICENSE`。
 - Mac 构建脚本映射源码和调试路径，Windows 使用 `-trimpath`；发布二进制前仍需扫描个人目录和其他隐私标记，不能只依赖源码已脱敏。
+- GitHub Actions 构建及标签发布在 `.github/workflows/build.yml`，产物平台、测试和下载说明见 `README.md`；Mac ZIP 保持应用签名与执行权限，并随各平台产物附 MIT 许可证及 SHA256。
 - 这是 macOS 本地 Swift 输入事件过滤工具。入口、状态机、菜单栏、输入法保持和离线自测在 `command-guard.swift`；网络配对在 `remote-peer.swift`，内存诊断在 `memory-diagnostics.swift`，Windows 托盘源码在 `windows/`；`start.command` 是终端启动器，`build-app.command` 使用 `Info.plist` 构建菜单栏应用。构建及验证命令见 `README.md`。
 - 离线模式仅修补通过完整路径核实的 UU 鼠标事件。局域网辅助模式已授权基于可靠源事件配对，仅修正 UU 键盘/鼠标的 Command、Option、Ctrl flags；不得修改键码、文字、类型、时间戳或补发/重放事件。flagsChanged 仍只观察，Mac 其他来源和未同步修饰键受到保护。
 - 输入回调不能执行文件写入、终端输出、进程枚举或等待网络。临时按键标识只允许进入有界内存匹配缓存和对端 IP 限制的 UDP 通讯；诊断/导出不得包含普通键码、文字、鼠标坐标或剪贴板。

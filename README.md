@@ -6,9 +6,9 @@ Mac 版本 `2026-10-01.8`。Windows 用 UU 远程操作 Mac 时，辅助修正 U
 
 ## 安装与配置
 
-1. 先按“源码与构建”章节构建所需程序。Mac 把生成的 `dist/UU 修补工具.app` 放入“应用程序”。先退出旧版本，再双击新应用。菜单栏出现 `UU` 或 `UU!`，不打开终端、不占 Dock。仓库不提交本地二进制和诊断文件。
+1. 从 [Releases](https://github.com/iomect/uu-command-guard/releases) 下载对应平台 ZIP，或按“源码与构建”章节自行构建。Mac 把解压后的 `UU 修补工具.app` 放入“应用程序”。先退出旧版本，再双击新应用。菜单栏出现 `UU` 或 `UU!`，不打开终端、不占 Dock。仓库不提交本地二进制和诊断文件。
 2. 在 Mac 菜单选择“打开辅助功能设置”，加入并授权此应用，然后点“重试启动监听”。更新本地签名后可能需要移除旧授权条目，再重新添加。监听初始化时先松开修饰键并停住鼠标，等待同步完成。
-3. Windows 双击 `dist/UUCommandBridge.exe`，会打开 Mac IPv4 设置窗口；保存或关闭窗口后继续在系统托盘运行，再次双击可重新打开设置。图标可能位于右下角的隐藏图标区域，悬停提示为“UU 局域网辅助”。这是单文件 x64 程序，不依赖 PowerShell、.NET、Go 运行时或终端窗口。托盘菜单可设置 Mac IP、暂停/恢复、导出诊断和退出；若首次添加托盘失败，会提示错误并退出。Windows 任务栏重建后会尝试恢复图标。
+3. Windows 双击解压或自行构建的 `UUCommandBridge.exe`，会打开 Mac IPv4 设置窗口；保存或关闭窗口后继续在系统托盘运行，再次双击可重新打开设置。图标可能位于右下角的隐藏图标区域，悬停提示为“UU 局域网辅助”。这是单文件 x64 程序，不依赖 PowerShell、.NET、Go 运行时或终端窗口。托盘菜单可设置 Mac IP、暂停/恢复、导出诊断和退出；若首次添加托盘失败，会提示错误并退出。Windows 任务栏重建后会尝试恢复图标。
 4. 两端填写**对方在局域网中的实际 IPv4 地址**：Windows 填 Mac 地址，Mac 填 Windows 地址。程序不会自动采用示例地址。UDP 端口固定 `47731`；不需要密钥。只接收配置 IP 和端口的报文。
 5. 打开 UU 的远程画面，正常输入或点击。至少三个唯一非移动事件配对，且包含普通键或鼠标按钮事件后，自动学习当前远程窗口。在此之前不启用网络修正。
 6. 在远程画面中分别按下并松开**左 Ctrl、左 Win、左 Alt**，让程序核对 UU 的 Ctrl→Command、Win→Control、Alt→Option 映射。菜单显示左侧验证进度 **3/3** 及尚未验证的左侧键名称，无需学习右侧。每一类完成左侧验证就可参与修正；若实际按住尚未验证的同类右侧键，保留该类原标记。右侧仍可自行完成验证后使用。导出诊断的 `remote.modifier_mapping_details` 保留六侧配对状态，`required` 表示是否必需；`verified_required_modifier_sides` 表示三项必需验证的进度。
@@ -59,6 +59,18 @@ Mac 另记录 `callback_publications`（决策前消费的内存发布数）、`
 应用清理 `~/Library/Application Support/UUCommandGuard/logs/`，命令行清理可执行文件旁的 `logs/`，保留原有容量和一小时清理规则。清理和运行实例共用运行锁。Mac 新版命令行工具与应用也共用单实例锁。
 
 ## 源码与构建
+
+### GitHub Actions 产物
+
+[Build applications](https://github.com/iomect/uu-command-guard/actions/workflows/build.yml) 在 main 更新、拉取请求及手动运行时构建。成功运行的 Artifacts 保留90天；推送 `v*` 标签后，在三套构建均成功且校验通过时自动发布到 Releases。手动运行时可填写 `release_tag`（例如 `v1.2.0`）同时发布；留空只生成 Artifacts。已有标签必须指向本次构建提交，避免覆盖其他版本的产物。
+
+- `UUCommandGuard-Mac-arm64.zip`：Apple Silicon Mac。
+- `UUCommandGuard-Mac-x86_64.zip`：Intel Mac。
+- `UUCommandBridge-Windows-x64.zip`：Windows x64。
+
+ZIP 包含程序、MIT 许可证和安装说明，同目录提供 `.sha256`。Mac 包保持应用权限和签名，支持 macOS 13 以上；使用 ad-hoc 签名，未经 Apple 公证。若系统阻止打开，请在“系统设置 → 隐私与安全性”中允许打开。Actions 执行离线测试，不创建系统输入监听；Windows 不运行会弹出对话框的 `--self-test`。
+
+### 本地构建
 
 Mac 需要系统 Swift 工具链，部署目标 macOS 13 以上；应用针对当前构建机器的架构生成。Windows 源码需要 Go 1.26 或以上，无第三方依赖。
 
