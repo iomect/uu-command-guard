@@ -5,7 +5,7 @@ import ApplicationServices
 import Carbon
 import Darwin
 
-let guard_version = "2026-10-01.13"
+let guard_version = "2026-10-02.14"
 let detailed_keyboard_diagnostics = CommandLine.arguments.contains("--diagnostic-session")
 let recovery_interval: UInt64 = 300_000_000
 let log_retention_seconds: TimeInterval = 3600
@@ -1438,9 +1438,30 @@ func self_test() throws {
     transport_diagnostic.sent(result:1,error:0)
     check(!transport_diagnostic.error_active && transport_diagnostic.last_send_errno == EHOSTUNREACH,
           "successful retry clears active error while retaining diagnostic history")
-    check(Set(transport_diagnostic.summary.keys) == Set(["counters","last_send_errno","last_receive_errno",
+    check(Set(transport_diagnostic.summary.keys) == Set(["counters","last_send_errno","last_receive_errno","last_socket_errno","socket_error_active",
           "send_error_active","receive_error_active","send_successes","received_datagrams"]),
           "transport diagnostics contain only fixed metadata fields")
+    transport_diagnostic.opened(error:EADDRINUSE)
+    check(transport_diagnostic.socket_error_active && transport_diagnostic.last_socket_errno == EADDRINUSE,
+          "socket initialization error preserves immediate errno")
+    transport_diagnostic.opened(error:0)
+    check(!transport_diagnostic.socket_error_active && transport_diagnostic.last_socket_errno == EADDRINUSE,
+          "reopened socket retains historical errno without an active error")
+    var recovery_policy = PeerTransportRecovery()
+    for delay:UInt64 in [1_000_000,2_000_000,4_000_000,8_000_000,8_000_000] {
+        check(recovery_policy.schedule() == delay,"recovery backoff doubles up to eight seconds")
+        let attempts = recovery_policy.attempts
+        check(recovery_policy.schedule() == nil && recovery_policy.attempts == attempts,
+              "pending recovery does not enqueue a duplicate or advance backoff")
+        recovery_policy.opening()
+        check(!recovery_policy.pending && recovery_policy.delay_us == delay,
+              "socket opening allows another retry without claiming an ACK")
+    }
+    recovery_policy.confirmed()
+    check(recovery_policy.delay_us == 0 && recovery_policy.schedule() == 1_000_000,
+          "actual ACK resets the next recovery delay")
+    check(Set(recovery_policy.summary.keys) == Set(["pending","attempts","delay_us"]),
+          "recovery exports only fixed policy metadata")
     print("PASS: \(checks) state/reconnect/log/input-source checks; no input taps created, input sources selected or events posted")
 }
 

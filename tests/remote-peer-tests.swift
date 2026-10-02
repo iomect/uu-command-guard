@@ -8,6 +8,22 @@ import Darwin
         checks += 1
         if !value() { fatalError("FAIL: \(label)") }
     }
+    @discardableResult static func wait_until(_ timeout:TimeInterval = 4,_ condition:()->Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            if condition() { return true }
+            if Date() >= deadline { return false }
+            RunLoop.main.run(until:Date().addingTimeInterval(0.005))
+        }
+    }
+    static func bind_loopback(_ fd:Int32,_ port:UInt16) -> Int32 {
+        var address = sockaddr_in(); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET); address.sin_port = port.bigEndian
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        return withUnsafePointer(to:&address) { $0.withMemoryRebound(to:sockaddr.self,capacity:1) {
+            Darwin.bind(fd,$0,socklen_t(MemoryLayout<sockaddr_in>.size))
+        } }
+    }
     static func input(_ id:UInt64,_ time:UInt64,_ key:Int = 4,_ mods:UInt16 = 0,_ kind:String = "key",_ action:String = "down",_ window:String = "window") -> PeerInput {
         PeerInput(id:id,time_us:time,window:window,kind:kind,key:key,action:action,mods:mods)
     }
@@ -572,6 +588,8 @@ import Darwin
         check(metadata.status_text?.contains("网络不可达") == true,"network failure is distinct from permissions")
         metadata.sent(result:199,error:0)
         check(!metadata.error_active && metadata.last_send_errno == EHOSTUNREACH && metadata.send_successes == 1,"successful retry clears active error but retains history")
+        for code in [EAGAIN,EWOULDBLOCK,EINTR] { metadata.sent(result:-1,error:code) }
+        check(!metadata.send_error_active && metadata.send_successes == 1 && metadata.counters["send_error"] == 2,"temporary send interruption neither fails transport nor counts as success")
         metadata.received(result:-1,error:EAGAIN)
         metadata.received(result:-1,error:EWOULDBLOCK)
         metadata.received(result:-1,error:EINTR)
@@ -580,9 +598,13 @@ import Darwin
         check(metadata.receive_error_active && metadata.last_receive_errno == EACCES,"receive failure records errno")
         metadata.received(result:199,error:0)
         check(!metadata.receive_error_active && metadata.received_datagrams == 1,"received datagram restores receive health")
+        metadata.opened(error:EADDRINUSE)
+        check(metadata.socket_error_active && metadata.last_socket_errno == EADDRINUSE && metadata.status_text?.contains("端口被占用") == true,"socket open failure preserves errno and status")
+        metadata.opened(error:0)
+        check(!metadata.socket_error_active && metadata.last_socket_errno == EADDRINUSE,"opening socket clears active failure and retains history")
         for reason in PeerTransportReason.allCases { metadata.reject(reason) }
         check(Set(metadata.counters.keys) == Set(PeerTransportReason.allCases.map(\.rawValue)),"transport counter keys have a fixed whitelist")
-        check(Set(metadata.summary.keys) == Set(["counters","last_send_errno","last_receive_errno","send_error_active","receive_error_active","send_successes","received_datagrams"]),"transport exports only bounded metadata")
+        check(Set(metadata.summary.keys) == Set(["counters","last_send_errno","last_receive_errno","last_socket_errno","socket_error_active","send_error_active","receive_error_active","send_successes","received_datagrams"]),"transport exports only bounded metadata")
         let encoded = String(data:try JSONSerialization.data(withJSONObject:metadata.summary),encoding:.utf8)!
         check(!encoded.contains("127.0.0.1") && !encoded.contains("events") && !encoded.contains("keycode"),"transport metadata does not export addresses or input identifiers")
 
@@ -592,9 +614,10 @@ import Darwin
             var attempts = 0
             func transmit(_ fd:Int32,_ data:Data,_ address:sockaddr_in)->(result:Int,error:Int32) {
                 lock.lock(); attempts += 1; let blocked = fail; lock.unlock()
-                return blocked ? (-1,EACCES) : peer_send_datagram(fd,data,address)
+                return blocked ? (-1,EHOSTUNREACH) : peer_send_datagram(fd,data,address)
             }
             func recover() { lock.lock(); fail = false; lock.unlock() }
+            func break_network() { lock.lock(); fail = true; lock.unlock() }
             var count:Int { lock.lock(); defer { lock.unlock() }; return attempts }
         }
         let state = SenderState()
@@ -610,16 +633,13 @@ import Darwin
         let remote = RemotePeerBridge(status_notice:{ _ in },local_port:49003,peer_port:49004,datagram_sender:state.transmit)
         defer { remote.stop(); RunLoop.main.run(until:Date().addingTimeInterval(0.05)) }
         try remote.configure(peer_ip:"127.0.0.1",enabled:true)
-        RunLoop.main.run(until:Date().addingTimeInterval(0.1))
-        check(remote.status_text.contains("系统拒绝"),"injected hello send error reaches main status")
+        check(wait_until { remote.status_text.contains("网络不可达") },"injected hello send error reaches main status")
         remote.configure_mapping(.default_mapping)
-        check(remote.status_text.contains("系统拒绝"),"manual mapping cannot conceal transport error")
+        check(remote.status_text.contains("网络不可达"),"manual mapping cannot conceal transport error")
         let first_attempts = state.count
-        RunLoop.main.run(until:Date().addingTimeInterval(1.1))
-        check(state.count > first_attempts,"failed hello keeps existing retry schedule")
+        check(wait_until { state.count > first_attempts },"failed hello retries after socket rebuild")
         state.recover()
-        RunLoop.main.run(until:Date().addingTimeInterval(1.1))
-        check(remote.status_text == "等待 Windows 连接","successful send alone does not claim acknowledgement")
+        check(wait_until { remote.status_text == "等待 Windows 连接" },"successful send alone does not claim acknowledgement")
         remote.configure_mapping(.default_mapping)
         check(remote.status_text == "等待 Windows 连接","manual configuration preserves waiting handshake state")
         var destination = address; destination.sin_port = UInt16(49003).bigEndian
@@ -652,8 +672,68 @@ import Darwin
         let counters = snapshot["counters"] as? [String:UInt64] ?? [:]
         check(counters["rejected_header"] == 1 && counters["rejected_session"] == 1 && counters["rejected_duplicate"] == 1 && counters["rejected_acknowledgement"] == 1,"receiver reports header session and duplicate rejection without payload")
         check(counters["send_error",default:0] >= 2 && snapshot["send_error_active"] as? Bool == false,"diagnostic retains failed retries after recovery")
+        remote.configure_keypad_plus(enabled:true)
+        // Populate a real source cache before losing the transport.
+        let window = UUID().uuidString
+        var prepare = PeerPacket(kind:"prepare",instance:win,peer:hello.instance,epoch:hello.epoch,generation:0,seq:4,time_us:peer_now_us())
+        prepare.window = window; prepare.scope = true; try send_packet(prepare)
+        RunLoop.main.run(until:Date().addingTimeInterval(0.05))
+        let activity = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true)!
+        activity.timestamp = DispatchTime.now().uptimeNanoseconds
+        _ = remote.observe(type:.keyDown,event:activity,now_ns:DispatchTime.now().uptimeNanoseconds,protected_mask:0)
+        func receive_packet(_ accepts:(PeerPacket)->Bool) -> PeerPacket? {
+            var buffer = [UInt8](repeating:0,count:1201)
+            while true {
+                let n = Darwin.recv(fd,&buffer,buffer.count,0)
+                if n < 0 { return nil }
+                if let packet = try? JSONDecoder().decode(PeerPacket.self,from:Data(buffer.prefix(n))), accepts(packet) { return packet }
+            }
+        }
+        var start:PeerPacket?
+        check(wait_until { start = receive_packet { $0.kind == "start" }; return start != nil },"source stream starts before recovery test")
+        var old_events = PeerPacket(kind:"events",instance:win,peer:hello.instance,epoch:hello.epoch,generation:start!.generation,seq:5,time_us:peer_now_us())
+        old_events.window = window; old_events.events = [input(1,old_events.time_us,4,0,"key","down",window)]
+        try send_packet(old_events)
+        check(wait_until { remote.diagnostic_summary()["source_cache_count"] as? Int == 1 },"real source evidence cached before transport failure")
+        state.break_network()
+        check(wait_until {
+            let recovery = remote.diagnostic_summary()["recovery"] as? [String:Any] ?? [:]
+            return recovery["pending"] as? Bool == true && remote.diagnostic_summary()["connected"] as? Bool == false
+        },"connected transport failure revokes acknowledgement")
+        check(remote.diagnostic_summary()["source_cache_count"] as? Int == 0 && remote.diagnostic_summary()["observation_cache_count"] as? Int == 0,"recovery clears both source and observation evidence")
+        activity.timestamp = DispatchTime.now().uptimeNanoseconds
+        check(remote.observe(type:.keyDown,event:activity,now_ns:DispatchTime.now().uptimeNanoseconds,protected_mask:0) == nil,"disconnected recovery cannot correct an input event")
+        let probe = Darwin.socket(AF_INET,SOCK_DGRAM,0)
+        check(probe >= 0,"recovery socket release probe")
+        check(wait_until(0.5) { bind_loopback(probe,49003) == 0 },"failed socket is released before backoff expires")
+        Darwin.close(probe)
+        state.recover()
+        var recovered_hello:PeerPacket?
+        check(wait_until {
+            recovered_hello = receive_packet { $0.kind == "hello" && $0.peer == win && $0.epoch != hello.epoch }
+            return recovered_hello != nil
+        },"rebuild offers a new epoch to the same Windows instance")
+        let new_hello = recovered_hello!
+        check(remote.diagnostic_summary()["connected"] as? Bool == false,"new epoch still requires actual ACK")
+        try send_packet(old_events)
+        RunLoop.main.run(until:Date().addingTimeInterval(0.05))
+        check(remote.diagnostic_summary()["source_cache_count"] as? Int == 0,"old epoch cannot refill evidence during recovery")
+        try send_packet(PeerPacket(kind:"hello",instance:win,peer:new_hello.instance,epoch:new_hello.epoch,generation:0,seq:6,time_us:peer_now_us()))
+        check(wait_until { remote.diagnostic_summary()["connected"] as? Bool == true },"same Windows instance ACK reconnects new epoch")
+        check((remote.diagnostic_summary()["recovery"] as? [String:Any])?["delay_us"] as? UInt64 == 0,"ACK resets retry backoff")
+        check(remote.manual_mapping == .default_mapping && remote.diagnostic_summary()["mapping_mode"] as? String == "manual" && remote.keypad_plus_enabled,"recovery retains manual mapping and keypad preference")
+        try send_packet(old_events)
+        RunLoop.main.run(until:Date().addingTimeInterval(0.05))
+        check(remote.diagnostic_summary()["source_cache_count"] as? Int == 0,"old epoch remains rejected after ACK")
+        check(wait_until(4) {
+            (remote.diagnostic_summary()["recovery"] as? [String:Any])?["pending"] as? Bool == true
+        },"peer silence triggers socket recovery after timeout")
         try remote.configure(peer_ip:"127.0.0.1",enabled:false)
-        RunLoop.main.run(until:Date().addingTimeInterval(0.1))
+        RunLoop.main.run(until:Date().addingTimeInterval(1.2))
+        check(remote.status_text == "辅助同步已暂停","pause cancels pending timeout recovery")
+        let paused_probe = Darwin.socket(AF_INET,SOCK_DGRAM,0)
+        check(bind_loopback(paused_probe,49003) == 0,"paused recovery does not reclaim listener port")
+        Darwin.close(paused_probe)
         let reset = remote.diagnostic_summary()["transport"] as? [String:Any] ?? [:]
         check((reset["counters"] as? [String:UInt64])?.isEmpty == true && remote.diagnostic_summary()["connected"] as? Bool == false,"new configuration resets transport and connected cache")
         let stale = RemotePeerBridge(status_notice:{ _ in },local_port:49005,peer_port:49006,datagram_sender:{ _,_,_ in (-1,EHOSTUNREACH) })
@@ -665,6 +745,99 @@ import Darwin
         RunLoop.main.run(until:Date().addingTimeInterval(0.1))
         let stale_summary = stale.diagnostic_summary()["transport"] as? [String:Any] ?? [:]
         check(stale.status_text == "辅助同步已暂停" && stale_summary["send_error_active"] as? Bool == false,"obsolete configuration error publication cannot revive paused connection")
+    }
+    static func startup_recovery() throws {
+        final class TransientSender {
+            var attempts = 0
+            func send(_ fd:Int32,_ data:Data,_ address:sockaddr_in)->(result:Int,error:Int32) {
+                attempts += 1
+                return attempts == 1 ? (-1,EAGAIN) : peer_send_datagram(fd,data,address)
+            }
+        }
+        let transient_state = TransientSender()
+        let transient = RemotePeerBridge(status_notice:{ _ in },local_port:49013,peer_port:49014,datagram_sender:transient_state.send)
+        try transient.configure(peer_ip:"127.0.0.1",enabled:true)
+        check(wait_until {
+            (transient.diagnostic_summary()["transport"] as? [String:Any])?["send_successes"] as? UInt64 ?? 0 > 0
+        },"temporary send failure retries normally")
+        let transient_summary = transient.diagnostic_summary()
+        check((transient_summary["recovery"] as? [String:Any])?["attempts"] as? UInt64 == 0
+              && (transient_summary["transport"] as? [String:Any])?["send_error_active"] as? Bool == false,
+              "temporary send failure preserves socket without transport backoff")
+        transient.stop()
+        let occupied = Darwin.socket(AF_INET,SOCK_DGRAM,0)
+        check(occupied >= 0 && bind_loopback(occupied,49007) == 0,"startup test occupies listener port")
+        let remote = RemotePeerBridge(status_notice:{ _ in },local_port:49007,peer_port:49008)
+        defer { remote.stop() }
+        try remote.configure(peer_ip:"127.0.0.1",enabled:true)
+        check(wait_until {
+            (remote.diagnostic_summary()["transport"] as? [String:Any])?["socket_error_active"] as? Bool == true
+        },"bind conflict is reported without aborting configuration")
+        Darwin.close(occupied)
+        check(wait_until { remote.status_text == "等待 Windows 连接" },"released bind conflict automatically reopens socket")
+        check(remote.diagnostic_summary()["connected"] as? Bool == false,"reopened socket alone cannot acknowledge peer")
+        remote.stop()
+        let stopped = RemotePeerBridge(status_notice:{ _ in },local_port:49009,peer_port:49010,datagram_sender:{ _,_,_ in (-1,EHOSTUNREACH) })
+        try stopped.configure(peer_ip:"127.0.0.1",enabled:true)
+        check(wait_until { (stopped.diagnostic_summary()["recovery"] as? [String:Any])?["pending"] as? Bool == true },"stop test has pending backoff")
+        stopped.stop()
+        let status = stopped.status_text
+        RunLoop.main.run(until:Date().addingTimeInterval(1.2))
+        let probe = Darwin.socket(AF_INET,SOCK_DGRAM,0)
+        defer { Darwin.close(probe) }
+        check(bind_loopback(probe,49009) == 0 && stopped.status_text == status,"stop cancels delayed recovery and leaves listener free")
+        final class StopFaultSender {
+            let lock = NSLock()
+            var failed_stops = 0
+            func send(_ fd:Int32,_ data:Data,_ address:sockaddr_in)->(result:Int,error:Int32) {
+                if (try? JSONDecoder().decode(PeerPacket.self,from:data))?.kind == "stop" {
+                    lock.lock(); failed_stops += 1; lock.unlock(); return (-1,EHOSTUNREACH)
+                }
+                return peer_send_datagram(fd,data,address)
+            }
+            var failures:Int { lock.lock(); defer { lock.unlock() }; return failed_stops }
+        }
+        let stop_peer = Darwin.socket(AF_INET,SOCK_DGRAM,0)
+        check(stop_peer >= 0 && bind_loopback(stop_peer,49012) == 0,"final stop test peer bound")
+        defer { Darwin.close(stop_peer) }
+        _ = fcntl(stop_peer,F_SETFL,O_NONBLOCK)
+        var stop_destination = sockaddr_in(); stop_destination.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        stop_destination.sin_family = sa_family_t(AF_INET); stop_destination.sin_port = UInt16(49011).bigEndian
+        stop_destination.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let stop_state = StopFaultSender()
+        let stopping = RemotePeerBridge(status_notice:{ _ in },local_port:49011,peer_port:49012,datagram_sender:stop_state.send)
+        try stopping.configure(peer_ip:"127.0.0.1",enabled:true)
+        check(wait_until { (stopping.diagnostic_summary()["transport"] as? [String:Any])?["send_successes"] as? UInt64 ?? 0 > 0 },"shutdown fault test begins with healthy transport")
+        let stop_win = UUID().uuidString; let stop_window = UUID().uuidString
+        func send_stop_peer(_ packet:PeerPacket) throws {
+            _ = peer_send_datagram(stop_peer,try JSONEncoder().encode(packet),stop_destination)
+        }
+        func receive_stop_peer(_ accepts:(PeerPacket)->Bool) -> PeerPacket? {
+            var buffer = [UInt8](repeating:0,count:1201)
+            while true {
+                let n = Darwin.recv(stop_peer,&buffer,buffer.count,0)
+                if n < 0 { return nil }
+                if let packet = try? JSONDecoder().decode(PeerPacket.self,from:Data(buffer.prefix(n))), accepts(packet) { return packet }
+            }
+        }
+        try send_stop_peer(PeerPacket(kind:"hello",instance:stop_win,peer:"",epoch:"",generation:0,seq:1,time_us:peer_now_us()))
+        var stop_hello:PeerPacket?
+        check(wait_until { stop_hello = receive_stop_peer { $0.kind == "hello" && $0.peer == stop_win }; return stop_hello != nil },"final stop test receives targeted handshake")
+        var stop_ack = PeerPacket(kind:"hello",instance:stop_win,peer:stop_hello!.instance,epoch:stop_hello!.epoch,generation:0,seq:2,time_us:peer_now_us())
+        stop_ack.scope = true; stop_ack.window = stop_window
+        try send_stop_peer(stop_ack)
+        check(wait_until { stopping.diagnostic_summary()["connected"] as? Bool == true },"final stop test acknowledges peer")
+        let event = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true)!
+        event.timestamp = DispatchTime.now().uptimeNanoseconds
+        _ = stopping.observe(type:.keyDown,event:event,now_ns:DispatchTime.now().uptimeNanoseconds,protected_mask:0)
+        var stop_start:PeerPacket?
+        check(wait_until { stop_start = receive_stop_peer { $0.kind == "start" }; return stop_start != nil },"final stop test activates stream")
+        stopping.stop()
+        check(stop_state.failures == 1,"final stop send actually encounters injected failure")
+        RunLoop.main.run(until:Date().addingTimeInterval(1.2))
+        let stop_probe = Darwin.socket(AF_INET,SOCK_DGRAM,0)
+        defer { Darwin.close(stop_probe) }
+        check(bind_loopback(stop_probe,49011) == 0,"failure sending final stop cannot revive closed transport")
     }
     static func keypad_plus() {
         func calibrated(enabled: Bool = true) -> PeerMatcher {
@@ -817,6 +990,7 @@ import Darwin
     }
     static func main() throws {
         try transport_diagnostics()
+        try startup_recovery()
         keypad_plus()
         manual_mappings()
         mapping_time_evidence()
